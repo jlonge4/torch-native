@@ -3,6 +3,10 @@
 Running Wan2.2-TI2V-5B (image-to-video) on AWS Trainium 2 using TorchNeuron Eager Mode.
 No diffusers — patched base code from the upstream Wan2.2 repo.
 
+<video src="outputs/wan22_832x480_61f_30steps.mp4" controls width="832"></video>
+
+*832×480, 61 frames, 30 steps, shift=5.0 — generated on trn2.3xlarge (TorchNeuron Eager)*
+
 ## Instance
 
 | | |
@@ -36,13 +40,14 @@ wan2.2/
 
 ## Confirmed working configurations
 
-| Resolution | Frames | Steps | Time | Notes |
+| Resolution | Frames | Steps | Denoise time | Notes |
 |---|---|---|---|---|
 | 256×256 | 5 | 1 | ~2 s | smoke test |
-| 480×256 | 21 | 20 | ~60 s | |
-| 480×256 | 81 | 30 | ~115 s | |
-| **832×480** | **21** | **30** | **~100 s** | **best quality — confirmed good output** |
-| 832×480 | 121 | — | OOM | seq too large for per-core HBM |
+| 480×256 | 21 | 20 | ~60 s | poor quality (wrong distribution) |
+| **832×480** | **21** | **30** | **~60 s** | **confirmed good quality** |
+| 832×480 | 41 | 30 | ~3 min | good quality |
+| 832×480 | 61 | 30 | ~5 min | good quality (see video above) |
+| 832×480 | 121 | — | OOM | too many tokens for per-core HBM |
 
 ## Base repo
 
@@ -239,9 +244,12 @@ Token count: `T = F_lat × (H/32) × (W/32)` where `F_lat = (frames-1)//4 + 1`
 | 256×256, 5f | 160 | ✓ |
 | 480×256, 21f | 720 | ✓ |
 | 480×256, 81f | 2520 | ✓ |
-| 832×480, 121f | 12090 | ✗ OOM on Neuron (`Failed to allocate resource`) |
+| 832×480, 21f | 2340 | ✓ |
+| 832×480, 41f | 4290 | ✓ |
+| 832×480, 61f | 6240 | ✓ |
+| 832×480, 121f | 12090 | ✗ OOM (`Failed to allocate resource`) |
 
-Keep T below ~4000 to stay within per-core HBM limits.
+Keep T below ~8000 on trn2.3xlarge (4 NeuronCores, 96 GB HBM).
 
 ---
 
