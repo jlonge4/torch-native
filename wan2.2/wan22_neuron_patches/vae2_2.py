@@ -1025,7 +1025,7 @@ class Wan2_2_VAE:
         try:
             if not isinstance(videos, list):
                 raise TypeError("videos should be a list")
-            with amp.autocast('neuron', dtype=self.dtype):
+            with amp.autocast('cpu', dtype=self.dtype, enabled=False):
                 return [
                     self.model.encode(u.unsqueeze(0),
                                       self.scale).float().squeeze(0)
@@ -1039,7 +1039,7 @@ class Wan2_2_VAE:
         try:
             if not isinstance(zs, list):
                 raise TypeError("zs should be a list")
-            with amp.autocast('neuron', dtype=self.dtype):
+            with amp.autocast('cpu', dtype=self.dtype, enabled=False):
                 return [
                     self.model.decode(u.cpu().unsqueeze(0),
                                       self.scale).float().clamp_(-1,

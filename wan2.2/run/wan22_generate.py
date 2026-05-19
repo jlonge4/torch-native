@@ -2,22 +2,28 @@ import argparse
 import sys
 sys.path.insert(0, '/home/ubuntu/Wan2.2')
 
+import imageio
+import numpy as np
 import torch
-import torchvision
+from PIL import Image
 from wan.configs.wan_ti2v_5B import ti2v_5B
 from wan.textimage2video import WanTI2V
 
 
 def save_video(video, save_file, fps=16):
-    """Save [C, T, H, W] float32 tensor in [-1,1] to mp4 via torchvision."""
-    frames = ((video.permute(1, 2, 3, 0).clamp(-1, 1) + 1) / 2 * 255).byte()
-    torchvision.io.write_video(save_file, frames, fps=fps)
+    """Save [C, T, H, W] float32 tensor in [-1,1] to mp4 via imageio."""
+    frames = ((video.permute(1, 2, 3, 0).clamp(-1, 1) + 1) / 2 * 255).byte().numpy()
+    with imageio.get_writer(save_file, fps=fps, format='ffmpeg', codec='libx264') as writer:
+        for frame in frames:
+            writer.append_data(frame)
 
 
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--prompt", default="A red panda playing in bamboo forest, cinematic, 4k")
-    p.add_argument("--size", default="480x256", help="WxH e.g. 480x256")
+    p.add_argument("--image", default=None,
+                   help="Input image for i2v mode. Use 'example' for the bundled example image.")
+    p.add_argument("--size", default="480x256", help="WxH e.g. 480x256 (only used in t2v mode)")
     p.add_argument("--frames", type=int, default=21)
     p.add_argument("--steps", type=int, default=20)
     p.add_argument("--fps", type=int, default=16)
@@ -31,6 +37,13 @@ def main():
     args = parse_args()
     w, h = map(int, args.size.split("x"))
 
+    img = None
+    if args.image == 'example':
+        args.image = f"{args.checkpoint_dir}/examples/i2v_input.JPG"
+    if args.image:
+        img = Image.open(args.image).convert('RGB')
+        print(f"Using input image: {args.image} ({img.width}x{img.height})", flush=True)
+
     print("Loading WanTI2V...", flush=True)
     pipeline = WanTI2V(
         config=ti2v_5B,
@@ -43,8 +56,9 @@ def main():
 
     video = pipeline.generate(
         input_prompt=args.prompt,
-        img=None,
+        img=img,
         size=(w, h),
+        max_area=w * h,
         frame_num=args.frames,
         sampling_steps=args.steps,
         guide_scale=5.0,

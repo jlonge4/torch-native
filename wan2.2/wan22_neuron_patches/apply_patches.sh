@@ -20,14 +20,16 @@ backup() {
     [[ -f "${src}.orig" ]] || cp "$src" "${src}.orig"
 }
 
+backup "$WAN_ROOT/modules/attention.py"
 backup "$WAN_ROOT/modules/vae2_2.py"
 backup "$WAN_ROOT/modules/t5.py"
 backup "$WAN_ROOT/modules/model.py"
 backup "$WAN_ROOT/textimage2video.py"
 
-cp "$PATCH_DIR/vae2_2.py"        "$WAN_ROOT/modules/vae2_2.py"
-cp "$PATCH_DIR/t5.py"            "$WAN_ROOT/modules/t5.py"
-cp "$PATCH_DIR/model.py"         "$WAN_ROOT/modules/model.py"
+cp "$PATCH_DIR/attention.py"       "$WAN_ROOT/modules/attention.py"
+cp "$PATCH_DIR/vae2_2.py"          "$WAN_ROOT/modules/vae2_2.py"
+cp "$PATCH_DIR/t5.py"              "$WAN_ROOT/modules/t5.py"
+cp "$PATCH_DIR/model.py"           "$WAN_ROOT/modules/model.py"
 cp "$PATCH_DIR/textimage2video.py" "$WAN_ROOT/textimage2video.py"
 
 echo "Patches applied."

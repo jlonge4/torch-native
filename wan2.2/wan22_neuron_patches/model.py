@@ -3,10 +3,11 @@ import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 
-from .attention import flash_attention
+from .attention import flash_attention, attention as _attention
 
 __all__ = ['WanModel']
 
@@ -27,46 +28,55 @@ def sinusoidal_embedding_1d(dim, position):
     return x.float()  # return float32 on CPU
 
 
-@torch.amp.autocast('neuron', enabled=False)
 def rope_params(max_seq_len, dim, theta=10000):
+    # Returns float32 (cos, sin) stacked as [max_seq_len, dim//2, 2].
+    # No complex dtypes, no float64 — both deadlock on Neuron.
     assert dim % 2 == 0
-    freqs = torch.outer(
-        torch.arange(max_seq_len),
-        1.0 / torch.pow(theta,
-                        torch.arange(0, dim, 2).to(torch.float64).div(dim)))
-    freqs = torch.polar(torch.ones_like(freqs), freqs)
-    return freqs
+    freqs = 1.0 / torch.pow(
+        torch.tensor(theta, dtype=torch.float32),
+        torch.arange(0, dim, 2, dtype=torch.float32).div(dim))
+    angles = torch.outer(torch.arange(max_seq_len, dtype=torch.float32), freqs)
+    return torch.stack([torch.cos(angles), torch.sin(angles)], dim=-1)
 
 
-@torch.amp.autocast('neuron', enabled=False)
 def rope_apply(x, grid_sizes, freqs):
+    # x:     [B, seq_len+pad, n_heads, head_dim]
+    # freqs: [max_seq_len, c, 2]  where c = head_dim//2, last dim = (cos, sin)
     n, c = x.size(2), x.size(3) // 2
 
-    # split freqs
-    freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+    # split freqs along the c axis for temporal / height / width components
+    fs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
 
-    # loop over samples
     output = []
     for i, (f, h, w) in enumerate(grid_sizes.tolist()):
         seq_len = f * h * w
 
-        # precompute multipliers
-        x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float64).reshape(
-            seq_len, n, -1, 2))
-        freqs_i = torch.cat([
-            freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
-            freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-            freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-        ],
-                            dim=-1).reshape(seq_len, 1, -1)
+        # build per-token cos/sin: [seq_len, 1, c]
+        cos_i = torch.cat([
+            fs[0][:f, :, 0].view(f, 1, 1, -1).expand(f, h, w, -1),
+            fs[1][:h, :, 0].view(1, h, 1, -1).expand(f, h, w, -1),
+            fs[2][:w, :, 0].view(1, 1, w, -1).expand(f, h, w, -1),
+        ], dim=-1).reshape(seq_len, 1, -1)
 
-        # apply rotary embedding
-        x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
-        x_i = torch.cat([x_i, x[i, seq_len:]])
+        sin_i = torch.cat([
+            fs[0][:f, :, 1].view(f, 1, 1, -1).expand(f, h, w, -1),
+            fs[1][:h, :, 1].view(1, h, 1, -1).expand(f, h, w, -1),
+            fs[2][:w, :, 1].view(1, 1, w, -1).expand(f, h, w, -1),
+        ], dim=-1).reshape(seq_len, 1, -1)
 
-        # append to collection
-        output.append(x_i)
-    return torch.stack(output).float()
+        # real-valued 2D rotation — no view_as_complex, no float64
+        # upcast to float32 for rotation precision, then cast back to input dtype
+        xi = x[i, :seq_len].float().reshape(seq_len, n, c, 2)
+        x0, x1 = xi[..., 0], xi[..., 1]
+        out = torch.stack([x0 * cos_i - x1 * sin_i,
+                           x0 * sin_i + x1 * cos_i], dim=-1).flatten(2)
+
+        # Neuron: torch.cat with zero-size tensor deadlocks — skip if no padding
+        tail = x[i, seq_len:]
+        output.append(torch.cat([out, tail.float()]) if tail.size(0) > 0 else out)
+    # Neuron: torch.stack with single-element list deadlocks — unsqueeze instead
+    stacked = output[0].unsqueeze(0) if len(output) == 1 else torch.stack(output)
+    return stacked.to(x.dtype)
 
 
 class WanRMSNorm(nn.Module):
@@ -98,7 +108,11 @@ class WanLayerNorm(nn.LayerNorm):
         Args:
             x(Tensor): Shape [B, L, C]
         """
-        return super().forward(x.float()).type_as(x)
+        # Upcast to float32 for precision; also upcast weight/bias if they exist
+        # (prevents dtype mismatch when model is in bfloat16 and autocast is disabled).
+        w = self.weight.float() if self.weight is not None else None
+        b = self.bias.float() if self.bias is not None else None
+        return F.layer_norm(x.float(), self.normalized_shape, w, b, self.eps).type_as(x)
 
 
 class WanSelfAttention(nn.Module):
@@ -145,7 +159,7 @@ class WanSelfAttention(nn.Module):
 
         q, k, v = qkv_fn(x)
 
-        x = flash_attention(
+        x = _attention(
             q=rope_apply(q, grid_sizes, freqs),
             k=rope_apply(k, grid_sizes, freqs),
             v=v,
@@ -174,8 +188,8 @@ class WanCrossAttention(WanSelfAttention):
         k = self.norm_k(self.k(context)).view(b, -1, n, d)
         v = self.v(context).view(b, -1, n, d)
 
-        # compute attention
-        x = flash_attention(q, k, v, k_lens=context_lens)
+        # compute attention (use _attention which falls back to sdpa when flash_attn absent)
+        x = _attention(q, k, v, k_lens=context_lens)
 
         # output
         x = x.flatten(2)
@@ -237,25 +251,31 @@ class WanAttentionBlock(nn.Module):
             grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
         """
+        import sys
         assert e.dtype == torch.float32
-        with torch.amp.autocast('neuron', dtype=torch.float32):
-            e = (self.modulation.unsqueeze(0) + e).chunk(6, dim=2)
+        print(f'[TRACE]   modulation... mod.dtype={self.modulation.dtype} mod.device={self.modulation.device} e.dtype={e.dtype}', flush=True); sys.stdout.flush()
+        mod_f32 = self.modulation.float()
+        print(f'[TRACE]   .float() done, dtype={mod_f32.dtype}', flush=True)
+        e = (mod_f32.unsqueeze(0) + e).chunk(6, dim=2)
         assert e[0].dtype == torch.float32
+        print('[TRACE]   modulation done', flush=True)
 
-        # self-attention
-        y = self.self_attn(
-            self.norm1(x).float() * (1 + e[1].squeeze(2)) + e[0].squeeze(2),
-            seq_lens, grid_sizes, freqs)
-        with torch.amp.autocast('neuron', dtype=torch.float32):
-            x = x + y * e[2].squeeze(2)
+        x_dtype = x.dtype
+        print('[TRACE]   norm1...', flush=True)
+        attn_in = (self.norm1(x).float() * (1 + e[1].squeeze(2)) + e[0].squeeze(2)).to(x_dtype)
+        print('[TRACE]   norm1 done, self_attn...', flush=True)
+        y = self.self_attn(attn_in, seq_lens, grid_sizes, freqs)
+        print('[TRACE]   self_attn done', flush=True)
+        x = (x.float() + y.float() * e[2].squeeze(2)).to(x_dtype)
 
-        # cross-attention & ffn function
         def cross_attn_ffn(x, context, context_lens, e):
+            print('[TRACE]   cross_attn...', flush=True)
             x = x + self.cross_attn(self.norm3(x), context, context_lens)
-            y = self.ffn(
-                self.norm2(x).float() * (1 + e[4].squeeze(2)) + e[3].squeeze(2))
-            with torch.amp.autocast('neuron', dtype=torch.float32):
-                x = x + y * e[5].squeeze(2)
+            print('[TRACE]   cross_attn done, ffn...', flush=True)
+            ffn_in = (self.norm2(x).float() * (1 + e[4].squeeze(2)) + e[3].squeeze(2)).to(x_dtype)
+            y = self.ffn(ffn_in)
+            print('[TRACE]   ffn done', flush=True)
+            x = (x.float() + y.float() * e[5].squeeze(2)).to(x_dtype)
             return x
 
         x = cross_attn_ffn(x, context, context_lens, e)
@@ -286,11 +306,11 @@ class Head(nn.Module):
             e(Tensor): Shape [B, L1, C]
         """
         assert e.dtype == torch.float32
-        with torch.amp.autocast('neuron', dtype=torch.float32):
-            e = (self.modulation.unsqueeze(0) + e.unsqueeze(2)).chunk(2, dim=2)
-            x = (
-                self.head(
-                    self.norm(x) * (1 + e[1].squeeze(2)) + e[0].squeeze(2)))
+        # Cast modulation to float32 explicitly; autocast('neuron') deadlocks.
+        e = (self.modulation.float().unsqueeze(0) + e.unsqueeze(2)).chunk(2, dim=2)
+        x_dtype = x.dtype
+        head_in = (self.norm(x).float() * (1 + e[1].squeeze(2)) + e[0].squeeze(2)).to(x_dtype)
+        x = self.head(head_in)
         return x
 
 
@@ -448,6 +468,10 @@ class WanModel(ModelMixin, ConfigMixin):
             x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
 
         # embeddings
+        # Cast x tensors to patch_embedding weight dtype (bfloat16 when convert_model_dtype=True)
+        # without relying on autocast (which hangs on TorchNeuron 2.11).
+        emb_dtype = self.patch_embedding.weight.dtype
+        x = [u.to(dtype=emb_dtype) for u in x]
         x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
         grid_sizes = torch.stack(
             [torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
@@ -465,10 +489,6 @@ class WanModel(ModelMixin, ConfigMixin):
         x = x_padded[0] if len(x_padded) == 1 else torch.cat(x_padded)
 
         # time embeddings
-        # Computed entirely on CPU in float32:
-        # - sinusoidal_embedding_1d needs float64 (neuron doesn't support float64)
-        # - autocast('neuron', float32) tries to cast bf16 weights → f32 ON device, which deadlocks
-        # - time_embedding/time_projection are lightweight MLPs; CPU cost is negligible
         t_cpu = t.float().cpu()
         if t_cpu.dim() == 1:
             t_cpu = t_cpu.expand(t_cpu.size(0), seq_len)
@@ -476,20 +496,23 @@ class WanModel(ModelMixin, ConfigMixin):
         t_flat = t_cpu.flatten()
         sin_emb = sinusoidal_embedding_1d(self.freq_dim, t_flat)  # float32, CPU
         # Move to neuron as bfloat16 (model weights are bf16; float32 input → matmul dtype mismatch)
-        sin_emb_dev = sin_emb.unflatten(0, (bt, seq_len)).to(dtype=torch.bfloat16, device=device)
+        # Cast sin_emb to model's emb_dtype (bfloat16 or float32) to match weight dtype.
+        # Without autocast (which hangs on TorchNeuron 2.11), must cast explicitly.
+        sin_emb_dev = sin_emb.unflatten(0, (bt, seq_len)).to(dtype=emb_dtype, device=device)
         e = self.time_embedding(sin_emb_dev)
         # Cast to float32: blocks assert e.dtype == float32 for modulation precision.
         # This is an activation cast (not a weight cast), so no Neuron deadlock.
         e0 = self.time_projection(e).unflatten(2, (6, self.dim)).float()
-
         # context
         context_lens = None
         # Neuron: pad on CPU; avoid stack([single]) which hangs.
         ctx_padded = []
         for u in context:
             if u.size(0) < self.text_len:
-                pad = torch.zeros(self.text_len - u.size(0), u.size(1), dtype=u.dtype)
-                u = torch.cat([u.cpu(), pad], dim=0).to(device)
+                pad = torch.zeros(self.text_len - u.size(0), u.size(1), dtype=emb_dtype)
+                u = torch.cat([u.cpu().to(dtype=emb_dtype), pad], dim=0).to(device)
+            else:
+                u = u.to(dtype=emb_dtype)
             ctx_padded.append(u)
         ctx_stacked = ctx_padded[0].unsqueeze(0) if len(ctx_padded) == 1 else torch.stack(ctx_padded)
         context = self.text_embedding(ctx_stacked)

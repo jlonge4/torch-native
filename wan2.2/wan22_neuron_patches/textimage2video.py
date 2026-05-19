@@ -325,7 +325,7 @@ class WanTI2V:
 
         # evaluation mode
         with (
-                torch.amp.autocast('neuron', dtype=self.param_dtype),
+                torch.amp.autocast('cpu', dtype=self.param_dtype, enabled=False),
                 torch.no_grad(),
                 no_sync(),
         ):
@@ -336,7 +336,7 @@ class WanTI2V:
                     shift=1,
                     use_dynamic_shifting=False)
                 sample_scheduler.set_timesteps(
-                    sampling_steps, device=self.device, shift=shift)
+                    sampling_steps, device='cpu', shift=shift)
                 timesteps = sample_scheduler.timesteps
             elif sample_solver == 'dpm++':
                 sample_scheduler = FlowDPMSolverMultistepScheduler(
@@ -346,14 +346,18 @@ class WanTI2V:
                 sampling_sigmas = get_sampling_sigmas(sampling_steps, shift)
                 timesteps, _ = retrieve_timesteps(
                     sample_scheduler,
-                    device=self.device,
+                    device='cpu',
                     sigmas=sampling_sigmas)
             else:
                 raise NotImplementedError("Unsupported solver.")
 
             # sample videos
             latents = noise
-            mask1, mask2 = masks_like(noise, zero=False)
+            # Masks and timestep arithmetic run on CPU — tiny per-element Neuron
+            # ops each trigger a separate NEFF compilation (minutes each); model
+            # forward() already calls t.float().cpu() internally so CPU is fine.
+            noise_cpu = [n.detach().cpu() for n in noise]
+            mask1, mask2 = masks_like(noise_cpu, zero=False)
 
             arg_c = {'context': context, 'seq_len': seq_len}
             arg_null = {'context': context_null, 'seq_len': seq_len}
@@ -366,19 +370,20 @@ class WanTI2V:
                 latent_model_input = latents
                 timestep = [t]
 
-                timestep = torch.stack(timestep)
+                # Keep on CPU — model.forward() calls t.float().cpu() anyway
+                timestep = torch.stack(timestep).float()
 
                 temp_ts = (mask2[0][0][:, ::2, ::2] * timestep).flatten()
                 temp_ts = torch.cat([
                     temp_ts,
                     temp_ts.new_ones(seq_len - temp_ts.size(0)) * timestep
                 ])
-                timestep = temp_ts.unsqueeze(0)
+                timestep = temp_ts.unsqueeze(0)  # CPU float32
 
                 noise_pred_cond = self.model(
-                    latent_model_input, t=timestep, **arg_c)[0]
+                    latent_model_input, t=timestep, **arg_c)[0].cpu()
                 noise_pred_uncond = self.model(
-                    latent_model_input, t=timestep, **arg_null)[0]
+                    latent_model_input, t=timestep, **arg_null)[0].cpu()
 
                 noise_pred = noise_pred_uncond + guide_scale * (
                     noise_pred_cond - noise_pred_uncond)
@@ -386,11 +391,11 @@ class WanTI2V:
                 temp_x0 = sample_scheduler.step(
                     noise_pred.unsqueeze(0),
                     t,
-                    latents[0].unsqueeze(0),
+                    latents[0].unsqueeze(0).cpu(),
                     return_dict=False,
                     generator=seed_g)[0]
-                latents = [temp_x0.squeeze(0)]
-            x0 = latents
+                latents = [temp_x0.squeeze(0).to(self.device)]
+            x0 = [l.cpu() for l in latents]
             if offload_model:
                 self.model.cpu()
                 torch.accelerator.synchronize() if hasattr(torch, 'accelerator') else None
@@ -506,7 +511,7 @@ class WanTI2V:
             context = [t.to(self.device) for t in context]
             context_null = [t.to(self.device) for t in context_null]
 
-        z = self.vae.encode([img])
+        z = self.vae.encode([img.cpu()])  # VAE is on CPU; move img back for encode
 
         @contextmanager
         def noop_no_sync():
@@ -516,7 +521,7 @@ class WanTI2V:
 
         # evaluation mode
         with (
-                torch.amp.autocast('neuron', dtype=self.param_dtype),
+                torch.amp.autocast('cpu', dtype=self.param_dtype, enabled=False),
                 torch.no_grad(),
                 no_sync(),
         ):
@@ -527,7 +532,7 @@ class WanTI2V:
                     shift=1,
                     use_dynamic_shifting=False)
                 sample_scheduler.set_timesteps(
-                    sampling_steps, device=self.device, shift=shift)
+                    sampling_steps, device='cpu', shift=shift)
                 timesteps = sample_scheduler.timesteps
             elif sample_solver == 'dpm++':
                 sample_scheduler = FlowDPMSolverMultistepScheduler(
@@ -537,15 +542,20 @@ class WanTI2V:
                 sampling_sigmas = get_sampling_sigmas(sampling_steps, shift)
                 timesteps, _ = retrieve_timesteps(
                     sample_scheduler,
-                    device=self.device,
+                    device='cpu',
                     sigmas=sampling_sigmas)
             else:
                 raise NotImplementedError("Unsupported solver.")
 
-            # sample videos
-            latent = noise
-            mask1, mask2 = masks_like([noise], zero=True)
-            latent = (1. - mask2[0]) * z[0] + mask2[0] * latent
+            # sample videos — masks/timestep/scheduler on CPU to avoid per-element
+            # Neuron NEFF compilations.
+            noise_cpu_i2v = noise.detach().cpu()
+            mask1, mask2 = masks_like([noise_cpu_i2v], zero=True)
+
+            # Pin frame 0 to the VAE-encoded reference; denoise other frames.
+            # mask2[0][:, 0] = 0 (reference), mask2[0][:, 1:] = 1 (noise).
+            latent_cpu = (1. - mask2[0]) * z[0].cpu() + mask2[0] * noise_cpu_i2v
+            latent = latent_cpu.to(self.device)
 
             arg_c = {
                 'context': [context[0]],
@@ -565,21 +575,22 @@ class WanTI2V:
                 latent_model_input = [latent.to(self.device)]
                 timestep = [t]
 
-                timestep = torch.stack(timestep).to(self.device)
+                # Keep on CPU — model.forward() calls t.float().cpu() anyway
+                timestep = torch.stack(timestep).float()
 
                 temp_ts = (mask2[0][0][:, ::2, ::2] * timestep).flatten()
                 temp_ts = torch.cat([
                     temp_ts,
                     temp_ts.new_ones(seq_len - temp_ts.size(0)) * timestep
                 ])
-                timestep = temp_ts.unsqueeze(0)
+                timestep = temp_ts.unsqueeze(0)  # CPU float32
 
                 noise_pred_cond = self.model(
-                    latent_model_input, t=timestep, **arg_c)[0]
+                    latent_model_input, t=timestep, **arg_c)[0].cpu()
                 if offload_model:
                     torch.neuron.empty_cache() if hasattr(torch, 'neuron') else None
                 noise_pred_uncond = self.model(
-                    latent_model_input, t=timestep, **arg_null)[0]
+                    latent_model_input, t=timestep, **arg_null)[0].cpu()
                 if offload_model:
                     torch.neuron.empty_cache() if hasattr(torch, 'neuron') else None
                 noise_pred = noise_pred_uncond + guide_scale * (
@@ -588,13 +599,14 @@ class WanTI2V:
                 temp_x0 = sample_scheduler.step(
                     noise_pred.unsqueeze(0),
                     t,
-                    latent.unsqueeze(0),
+                    latent.unsqueeze(0).cpu(),
                     return_dict=False,
                     generator=seed_g)[0]
-                latent = temp_x0.squeeze(0)
-                latent = (1. - mask2[0]) * z[0] + mask2[0] * latent
+                latent_cpu = temp_x0.squeeze(0)
+                latent_cpu = (1. - mask2[0]) * z[0] + mask2[0] * latent_cpu
+                latent = latent_cpu.to(self.device)
 
-                x0 = [latent]
+                x0 = [latent_cpu]
                 del latent_model_input, timestep
 
             if offload_model:
