@@ -251,30 +251,20 @@ class WanAttentionBlock(nn.Module):
             grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
         """
-        import sys
         assert e.dtype == torch.float32
-        print(f'[TRACE]   modulation... mod.dtype={self.modulation.dtype} mod.device={self.modulation.device} e.dtype={e.dtype}', flush=True); sys.stdout.flush()
         mod_f32 = self.modulation.float()
-        print(f'[TRACE]   .float() done, dtype={mod_f32.dtype}', flush=True)
         e = (mod_f32.unsqueeze(0) + e).chunk(6, dim=2)
         assert e[0].dtype == torch.float32
-        print('[TRACE]   modulation done', flush=True)
 
         x_dtype = x.dtype
-        print('[TRACE]   norm1...', flush=True)
         attn_in = (self.norm1(x).float() * (1 + e[1].squeeze(2)) + e[0].squeeze(2)).to(x_dtype)
-        print('[TRACE]   norm1 done, self_attn...', flush=True)
         y = self.self_attn(attn_in, seq_lens, grid_sizes, freqs)
-        print('[TRACE]   self_attn done', flush=True)
         x = (x.float() + y.float() * e[2].squeeze(2)).to(x_dtype)
 
         def cross_attn_ffn(x, context, context_lens, e):
-            print('[TRACE]   cross_attn...', flush=True)
             x = x + self.cross_attn(self.norm3(x), context, context_lens)
-            print('[TRACE]   cross_attn done, ffn...', flush=True)
             ffn_in = (self.norm2(x).float() * (1 + e[4].squeeze(2)) + e[3].squeeze(2)).to(x_dtype)
             y = self.ffn(ffn_in)
-            print('[TRACE]   ffn done', flush=True)
             x = (x.float() + y.float() * e[5].squeeze(2)).to(x_dtype)
             return x
 
