@@ -316,7 +316,7 @@ class WanTI2V:
             self.text_encoder.model.to(self.device)
             context = self.text_encoder([input_prompt], self.device)
             context_null = self.text_encoder([n_prompt], self.device)
-            if offload_model:
+            if offload_model or self.tp_degree > 1:
                 self.text_encoder.model.cpu()
         else:
             context = self.text_encoder([input_prompt], torch.device('cpu'))
@@ -413,7 +413,7 @@ class WanTI2V:
                     generator=seed_g)[0]
                 latents = [temp_x0.squeeze(0).to(self.device)]
             x0 = [l.to(self.vae.device) for l in latents]
-            if offload_model:
+            if offload_model or self.tp_degree > 1:
                 self.model.cpu()
                 torch.accelerator.synchronize() if hasattr(torch, 'accelerator') else None
                 torch.neuron.empty_cache() if hasattr(torch, 'neuron') else None
@@ -524,7 +524,7 @@ class WanTI2V:
             self.text_encoder.model.to(self.device)
             context = self.text_encoder([input_prompt], self.device)
             context_null = self.text_encoder([n_prompt], self.device)
-            if offload_model:
+            if offload_model or self.tp_degree > 1:
                 self.text_encoder.model.cpu()
         else:
             context = self.text_encoder([input_prompt], torch.device('cpu'))
@@ -630,7 +630,7 @@ class WanTI2V:
                 x0 = [latent_cpu.to(self.vae.device)]
                 del latent_model_input, timestep
 
-            if offload_model:
+            if offload_model or self.tp_degree > 1:
                 self.model.cpu()
                 torch.accelerator.synchronize() if hasattr(torch, 'accelerator') else None
                 torch.neuron.empty_cache() if hasattr(torch, 'neuron') else None
