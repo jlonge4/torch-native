@@ -40,7 +40,8 @@ wan2.2/
 |---|---|---|---|---|
 | 256×256 | 5 | 1 | ~2 s | smoke test |
 | 480×256 | 21 | 20 | ~60 s | |
-| **480×256** | **81** | **30** | **~115 s** | best confirmed config |
+| 480×256 | 81 | 30 | ~115 s | |
+| **832×480** | **21** | **30** | **~100 s** | **best quality — confirmed good output** |
 | 832×480 | 121 | — | OOM | seq too large for per-core HBM |
 
 ## Base repo

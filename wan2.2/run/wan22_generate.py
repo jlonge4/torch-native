@@ -23,9 +23,12 @@ def parse_args():
     p.add_argument("--prompt", default="A red panda playing in bamboo forest, cinematic, 4k")
     p.add_argument("--image", default=None,
                    help="Input image for i2v mode. Use 'example' for the bundled example image.")
-    p.add_argument("--size", default="480x256", help="WxH e.g. 480x256 (only used in t2v mode)")
+    p.add_argument("--size", default="832x480", help="WxH e.g. 832x480")
     p.add_argument("--frames", type=int, default=21)
-    p.add_argument("--steps", type=int, default=20)
+    p.add_argument("--steps", type=int, default=30)
+    p.add_argument("--shift", type=float, default=None,
+                   help="Noise schedule shift. Defaults to 5.0.")
+    p.add_argument("--guide-scale", type=float, default=5.0)
     p.add_argument("--fps", type=int, default=16)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--output", default="/home/ubuntu/wan22_output.mp4")
@@ -54,14 +57,17 @@ def main():
     )
     print("Loaded.", flush=True)
 
+    shift = args.shift if args.shift is not None else 5.0
+
     video = pipeline.generate(
         input_prompt=args.prompt,
         img=img,
         size=(w, h),
         max_area=w * h,
         frame_num=args.frames,
+        shift=shift,
         sampling_steps=args.steps,
-        guide_scale=5.0,
+        guide_scale=args.guide_scale,
         seed=args.seed,
         offload_model=True,
     )
