@@ -127,6 +127,7 @@ class WanSelfAttention(nn.Module):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
+        self.num_heads_local = num_heads  # overridden by apply_wan_tp for TP
         self.head_dim = dim // num_heads
         self.window_size = window_size
         self.qk_norm = qk_norm
@@ -148,7 +149,7 @@ class WanSelfAttention(nn.Module):
             grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
         """
-        b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
+        b, s, n, d = *x.shape[:2], self.num_heads_local, self.head_dim
 
         # query, key, value function
         def qkv_fn(x):
@@ -181,7 +182,7 @@ class WanCrossAttention(WanSelfAttention):
             context(Tensor): Shape [B, L2, C]
             context_lens(Tensor): Shape [B]
         """
-        b, n, d = x.size(0), self.num_heads, self.head_dim
+        b, n, d = x.size(0), self.num_heads_local, self.head_dim
 
         # compute query, key, value
         q = self.norm_q(self.q(x)).view(b, -1, n, d)
@@ -302,6 +303,66 @@ class Head(nn.Module):
         head_in = (self.norm(x).float() * (1 + e[1].squeeze(2)) + e[0].squeeze(2)).to(x_dtype)
         x = self.head(head_in)
         return x
+
+
+def apply_wan_tp(model, rank, tp_degree):
+    """
+    Shard WanModel transformer blocks across tp_degree NeuronCores.
+
+    Strategy: manual weight sharding + dist.all_reduce forward hooks.
+    Avoids DTensor / parallelize_module so the existing eager Neuron path
+    is unchanged — only the linear weights are sliced per-rank and the
+    row-parallel outputs are all-reduced.
+
+    ColwiseParallel (q, k, v, ffn[0]):  split weight on dim=0 (output rows)
+    RowwiseParallel (o, ffn[2]):         split weight on dim=1 (input cols),
+                                         bias only on rank 0, all_reduce output
+    """
+    import torch.distributed as dist
+
+    pg = dist.group.WORLD  # default process group set up by caller
+
+    def _col_shard(linear, rank, tp_degree):
+        """Split output dim (colwise)."""
+        w = linear.weight.data.chunk(tp_degree, dim=0)[rank].contiguous()
+        linear.weight = nn.Parameter(w)
+        if linear.bias is not None:
+            b = linear.bias.data.chunk(tp_degree, dim=0)[rank].contiguous()
+            linear.bias = nn.Parameter(b)
+
+    def _row_shard(linear, rank, tp_degree):
+        """Split input dim (rowwise); bias only on rank 0."""
+        w = linear.weight.data.chunk(tp_degree, dim=1)[rank].contiguous()
+        linear.weight = nn.Parameter(w)
+        if linear.bias is not None and rank != 0:
+            linear.bias = nn.Parameter(torch.zeros_like(linear.bias))
+
+    def _make_allreduce_hook(pg):
+        def hook(module, input, output):
+            dist.all_reduce(output, op=dist.ReduceOp.SUM, group=pg)
+            return output
+        return hook
+
+    for block in model.blocks:
+        for attn in (block.self_attn, block.cross_attn):
+            _col_shard(attn.q, rank, tp_degree)
+            _col_shard(attn.k, rank, tp_degree)
+            _col_shard(attn.v, rank, tp_degree)
+            _row_shard(attn.o, rank, tp_degree)
+            attn.o.register_forward_hook(_make_allreduce_hook(pg))
+            # norm_q/norm_k weight must match sharded q/k/v output dim
+            for norm in (attn.norm_q, attn.norm_k):
+                if isinstance(norm, WanRMSNorm):
+                    norm.weight = nn.Parameter(
+                        norm.weight.data.chunk(tp_degree, dim=0)[rank].contiguous()
+                    )
+            attn.num_heads_local = attn.num_heads // tp_degree
+
+        _col_shard(block.ffn[0], rank, tp_degree)
+        _row_shard(block.ffn[2], rank, tp_degree)
+        block.ffn[2].register_forward_hook(_make_allreduce_hook(pg))
+
+    return model
 
 
 class WanModel(ModelMixin, ConfigMixin):

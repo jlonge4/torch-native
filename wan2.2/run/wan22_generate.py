@@ -33,6 +33,9 @@ def parse_args():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--output", default="/home/ubuntu/wan22_output.mp4")
     p.add_argument("--checkpoint-dir", default="/home/ubuntu/Wan2.2/Wan2.2-TI2V-5B")
+    p.add_argument("--tp-degree", type=int, default=1,
+                   help="Tensor parallel degree. Use 4 for all NeuronCores on trn2.3xlarge. "
+                        "Must be launched with: torchrun --nproc-per-node TP_DEGREE")
     return p.parse_args()
 
 
@@ -54,6 +57,7 @@ def main():
         device_id=0,
         init_on_cpu=True,
         convert_model_dtype=True,
+        tp_degree=args.tp_degree,
     )
     print("Loaded.", flush=True)
 

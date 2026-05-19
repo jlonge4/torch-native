@@ -18,7 +18,7 @@ from tqdm import tqdm
 from .distributed.fsdp import shard_model
 from .distributed.sequence_parallel import sp_attn_forward, sp_dit_forward
 from .distributed.util import get_world_size
-from .modules.model import WanModel
+from .modules.model import WanModel, apply_wan_tp
 from .modules.t5 import T5EncoderModel
 from .modules.vae2_2 import Wan2_2_VAE
 from .utils.fm_solvers import (
@@ -44,6 +44,7 @@ class WanTI2V:
         t5_cpu=False,
         init_on_cpu=True,
         convert_model_dtype=False,
+        tp_degree=1,
     ):
         r"""
         Initializes the Wan text-to-video generation model components.
@@ -71,6 +72,12 @@ class WanTI2V:
                 Convert DiT model parameters dtype to 'config.param_dtype'.
                 Only works without FSDP.
         """
+        self.tp_degree = tp_degree
+        if tp_degree > 1:
+            if not dist.is_initialized():
+                dist.init_process_group(backend="neuron")
+            rank = dist.get_rank()
+            device_id = rank  # each rank owns its NeuronCore
         self.device = torch.device(f"neuron:{device_id}")
         self.config = config
         self.rank = rank
@@ -106,6 +113,12 @@ class WanTI2V:
             dit_fsdp=dit_fsdp,
             shard_fn=shard_fn,
             convert_model_dtype=convert_model_dtype)
+
+        if tp_degree > 1:
+            # load on CPU → shard weights across ranks → move to device
+            apply_wan_tp(self.model, rank=self.rank, tp_degree=tp_degree)
+            self.model.to(self.device)
+            self.init_on_cpu = False  # already on device; skip re-move in loop
 
         if use_sp:
             self.sp_size = get_world_size()
@@ -279,6 +292,10 @@ class WanTI2V:
                 - H: Frame height (from size)
                 - W: Frame width from size)
         """
+        # TP model weights are sharded across devices — cannot offload to CPU
+        if self.tp_degree > 1:
+            offload_model = False
+
         # preprocess
         F = frame_num
         target_shape = (self.vae.model.z_dim, (F - 1) // self.vae_stride[0] + 1,
@@ -484,6 +501,10 @@ class WanTI2V:
             oh // self.vae_stride[1]) * (ow // self.vae_stride[2]) // (
                 self.patch_size[1] * self.patch_size[2])
         seq_len = int(math.ceil(seq_len / self.sp_size)) * self.sp_size
+
+        # TP model weights are sharded across devices — cannot offload to CPU
+        if self.tp_degree > 1:
+            offload_model = False
 
         seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
         seed_g = torch.Generator(device=torch.device("cpu"))
