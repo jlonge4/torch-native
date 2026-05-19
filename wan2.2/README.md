@@ -3,7 +3,7 @@
 Running Wan2.2-TI2V-5B (image-to-video) on AWS Trainium 2 using TorchNeuron Eager Mode.
 No diffusers — patched base code from the upstream Wan2.2 repo.
 
-<video src="outputs/wan22_832x480_61f_30steps.mp4" controls width="832"></video>
+![wan22_832x480_61f_30steps](outputs/wan22_832x480_61f_30steps.gif)
 
 *832×480, 61 frames, 30 steps, shift=5.0 — generated on trn2.3xlarge (TorchNeuron Eager)*
 
