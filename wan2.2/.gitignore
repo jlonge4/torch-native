@@ -1,0 +1,11 @@
+__pycache__/
+.DS_Store
+.vscode*
+tmp_examples*
+new_checkpoint*
+batch_test*
+nohup*
+# Model checkpoints (too large for git)
+Wan2.2-TI2V-5B/
+*.safetensors
+*.pth
