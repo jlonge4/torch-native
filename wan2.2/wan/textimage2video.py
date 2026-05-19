@@ -96,7 +96,7 @@ class WanTI2V:
         self.patch_size = config.patch_size
         self.vae = Wan2_2_VAE(
             vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
-            device='cpu')
+            device=self.device)
 
         logging.info(f"Creating WanModel from {checkpoint_dir}")
         self.model = WanModel.from_pretrained(checkpoint_dir)
@@ -395,7 +395,7 @@ class WanTI2V:
                     return_dict=False,
                     generator=seed_g)[0]
                 latents = [temp_x0.squeeze(0).to(self.device)]
-            x0 = [l.cpu() for l in latents]
+            x0 = [l.to(self.vae.device) for l in latents]
             if offload_model:
                 self.model.cpu()
                 torch.accelerator.synchronize() if hasattr(torch, 'accelerator') else None
@@ -511,7 +511,7 @@ class WanTI2V:
             context = [t.to(self.device) for t in context]
             context_null = [t.to(self.device) for t in context_null]
 
-        z = self.vae.encode([img.cpu()])  # VAE is on CPU; move img back for encode
+        z = [t.cpu() for t in self.vae.encode([img.to(self.device)])]
 
         @contextmanager
         def noop_no_sync():
@@ -606,7 +606,7 @@ class WanTI2V:
                 latent_cpu = (1. - mask2[0]) * z[0] + mask2[0] * latent_cpu
                 latent = latent_cpu.to(self.device)
 
-                x0 = [latent_cpu]
+                x0 = [latent_cpu.to(self.vae.device)]
                 del latent_model_input, timestep
 
             if offload_model:

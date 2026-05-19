@@ -1041,9 +1041,9 @@ class Wan2_2_VAE:
                 raise TypeError("zs should be a list")
             with amp.autocast('cpu', dtype=self.dtype, enabled=False):
                 return [
-                    self.model.decode(u.cpu().unsqueeze(0),
+                    self.model.decode(u.unsqueeze(0),
                                       self.scale).float().clamp_(-1,
-                                                                 1).squeeze(0)
+                                                                 1).squeeze(0).cpu()
                     for u in zs
                 ]
         except TypeError as e:
