@@ -44,7 +44,6 @@ class WanTI2V:
         t5_cpu=False,
         init_on_cpu=True,
         convert_model_dtype=False,
-        use_compile=False,
     ):
         r"""
         Initializes the Wan text-to-video generation model components.
@@ -107,11 +106,6 @@ class WanTI2V:
             dit_fsdp=dit_fsdp,
             shard_fn=shard_fn,
             convert_model_dtype=convert_model_dtype)
-
-        self.use_compile = use_compile
-        if use_compile:
-            self.model.to(self.device)
-            self.model = torch.compile(self.model, backend="neuron")
 
         if use_sp:
             self.sp_size = get_world_size()
@@ -285,9 +279,6 @@ class WanTI2V:
                 - H: Frame height (from size)
                 - W: Frame width from size)
         """
-        # compiled model must stay on device — disable CPU offload
-        offload_model = offload_model and not self.use_compile
-
         # preprocess
         F = frame_num
         target_shape = (self.vae.model.z_dim, (F - 1) // self.vae_stride[0] + 1,
@@ -493,9 +484,6 @@ class WanTI2V:
             oh // self.vae_stride[1]) * (ow // self.vae_stride[2]) // (
                 self.patch_size[1] * self.patch_size[2])
         seq_len = int(math.ceil(seq_len / self.sp_size)) * self.sp_size
-
-        # compiled model must stay on device — disable CPU offload
-        offload_model = offload_model and not self.use_compile
 
         seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
         seed_g = torch.Generator(device=torch.device("cpu"))

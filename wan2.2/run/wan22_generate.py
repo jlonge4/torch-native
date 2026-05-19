@@ -33,8 +33,6 @@ def parse_args():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--output", default="/home/ubuntu/wan22_output.mp4")
     p.add_argument("--checkpoint-dir", default="/home/ubuntu/Wan2.2/Wan2.2-TI2V-5B")
-    p.add_argument("--compile", action="store_true",
-                   help="Compile DiT with torch.compile(backend='neuron'). Slower first run, faster after.")
     return p.parse_args()
 
 
@@ -56,7 +54,6 @@ def main():
         device_id=0,
         init_on_cpu=True,
         convert_model_dtype=True,
-        use_compile=args.compile,
     )
     print("Loaded.", flush=True)
 
