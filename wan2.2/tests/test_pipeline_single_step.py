@@ -62,7 +62,10 @@ def main():
     print(f"\nRunning single-step t2v: size={size}, frames={frame_num}, steps={sampling_steps}")
     print(f"Prompt: '{args.prompt}'")
 
-    video = pipeline.generate(
+    # latent_only=True skips VAE decode so DiT NEFFs don't block it in the
+    # same process (same constraint that requires two-phase exec in production).
+    # VAE round-trip is covered by test_vae.py.
+    latent = pipeline.generate(
         input_prompt=args.prompt,
         img=None,
         size=size,
@@ -71,11 +74,12 @@ def main():
         guide_scale=5.0,
         seed=42,
         offload_model=True,
+        latent_only=True,
     )
 
-    if video is not None:
-        print(f"\nPASS — output video shape: {video.shape}  dtype: {video.dtype}")
-        print(f"       value range: [{video.min():.3f}, {video.max():.3f}]")
+    if latent is not None:
+        print(f"\nPASS — latent shape: {latent.shape}  dtype: {latent.dtype}")
+        print(f"       value range: [{latent.min():.3f}, {latent.max():.3f}]")
     else:
         print("\nWARNING — generate() returned None (non-rank-0 process?)")
 
