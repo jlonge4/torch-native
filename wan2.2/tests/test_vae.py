@@ -1,13 +1,9 @@
 """
 VAE encode → decode round-trip test.
 
-Validates the Wan2_2_VAE forward pass using a small dummy tensor.
-Without --vae-pth runs with randomly-initialized weights (no checkpoint needed).
-
 Usage:
-    python tests/test_vae.py
-    python tests/test_vae.py --vae-pth /path/to/Wan2.2-TI2V-5B/Wan_VAE_C48.pth
-    python tests/test_vae.py --vae-pth /path/to/... --device neuron
+    python tests/test_vae.py --checkpoint-dir /path/to/Wan2.2-TI2V-5B
+    python tests/test_vae.py --checkpoint-dir /path/to/... --device neuron
 """
 import argparse
 import os
@@ -16,12 +12,13 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import torch
+from wan.configs.wan_ti2v_5B import ti2v_5B
 
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--vae-pth", default=None,
-                   help="Path to Wan_VAE_C48.pth (optional; omit to use random weights)")
+    p.add_argument("--checkpoint-dir", default="/home/ubuntu/Wan2.2-TI2V-5B",
+                   help="Path to TI2V-5B checkpoint directory")
     p.add_argument("--device", default="cpu",
                    help="'cpu' or 'neuron' (default: cpu)")
     return p.parse_args()
@@ -32,9 +29,12 @@ def main():
 
     from wan.modules.vae2_2 import Wan2_2_VAE
 
+    vae_pth = os.path.join(args.checkpoint_dir, ti2v_5B.vae_checkpoint)
     print(f"Device: {args.device}")
+    print(f"Loading VAE from {vae_pth}")
+
     vae = Wan2_2_VAE(
-        vae_pth=args.vae_pth,
+        vae_pth=vae_pth,
         device=torch.device(args.device),
     )
     print("VAE initialised.")
