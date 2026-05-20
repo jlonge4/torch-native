@@ -826,13 +826,13 @@ class WanVAE_(nn.Module):
                     feat_cache=self._feat_map,
                     feat_idx=self._conv_idx,
                     first_chunk=True,
-                )
+                ).cpu()
             else:
                 out_ = self.decoder(
                     x[:, :, i:i + 1, :, :],
                     feat_cache=self._feat_map,
                     feat_idx=self._conv_idx,
-                )
+                ).cpu()
                 out = torch.cat([out, out_], 2)
         out = unpatchify(out, patch_size=2)
         self.clear_cache()
