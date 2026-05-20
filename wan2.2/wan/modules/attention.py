@@ -162,13 +162,11 @@ def attention(
             version=fa_version,
         )
     else:
-        # Build key-padding mask from k_lens so padding tokens are not attended to.
+        if q_lens is not None or k_lens is not None:
+            warnings.warn(
+                'Padding mask is disabled when using scaled_dot_product_attention. It can have a significant impact on performance.'
+            )
         attn_mask = None
-        if k_lens is not None:
-            # [B, 1, 1, Lk] boolean mask — True = valid, False = masked out
-            lk = k.size(1)
-            attn_mask = (torch.arange(lk, device=k.device).unsqueeze(0) <
-                         k_lens.to(k.device).unsqueeze(1)).unsqueeze(1).unsqueeze(2)
 
         q = q.transpose(1, 2).to(dtype)
         k = k.transpose(1, 2).to(dtype)
