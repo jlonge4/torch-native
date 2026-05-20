@@ -37,27 +37,38 @@ MFU = model FLOP utilization against 4 × 158 TFLOP/s (BF16) = 632 TFLOP/s aggre
 |---|---|
 | Instance type | `trn2.3xlarge` |
 | NeuronCores | 4 (24 GB HBM each, 96 GB total) |
-| Venv | `/home/ubuntu/moduscope-deps-20260518-105742/ms_venv` |
-| Repo | `/home/ubuntu/torch-native` |
-| Weights | `/home/ubuntu/Wan2.2-TI2V-5B` |
 
 ## Quickstart
 
-```bash
-source /home/ubuntu/moduscope-deps-20260518-105742/ms_venv/bin/activate
-cd /home/ubuntu/torch-native/wan2.2
+### Requirements
 
+- Python 3.12
+- [AWS Neuron SDK](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/general/setup/neuron-setup/pytorch/neuronx/ubuntu/torch-neuronx-ubuntu22-pip-install.html) (`torch-neuronx`, `neuronx-cc`)
+- `torch`, `torchvision`, `diffusers`, `transformers`, `imageio[ffmpeg]`, `Pillow`, `tqdm`
+- Wan2.2-TI2V-5B weights from [Hugging Face](https://huggingface.co/Wan-Video/Wan2.2-TI2V-5B)
+
+### Install
+
+```bash
+git clone https://github.com/jlonge4/torch-native.git
+cd torch-native/wan2.2
+pip install -r requirements.txt
+```
+
+### Generate
+
+```bash
 # TP=4 + torch.compile — two-phase execution (denoise then VAE decode)
 # First run compiles and caches NEFFs (~6 min); subsequent runs use cache (~5 min)
 python run/wan22_generate.py \
   --tp-degree 4 --compile \
-  --checkpoint-dir /home/ubuntu/Wan2.2-TI2V-5B \
+  --checkpoint-dir /path/to/Wan2.2-TI2V-5B \
   --frames 61 --size 832x480 --steps 30 \
   --output output.mp4
 
 # Single-core eager baseline
 python run/wan22_generate.py \
-  --checkpoint-dir /home/ubuntu/Wan2.2-TI2V-5B \
+  --checkpoint-dir /path/to/Wan2.2-TI2V-5B \
   --frames 21 --size 832x480 --steps 30 \
   --output output.mp4
 ```
