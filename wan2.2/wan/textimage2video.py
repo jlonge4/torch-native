@@ -79,6 +79,7 @@ class WanTI2V:
                 dist.init_process_group(backend="neuron")
             rank = dist.get_rank()
             device_id = rank  # each rank owns its NeuronCore
+            t5_cpu = True  # avoid replicating T5 (~11GB) across all NeuronCores
         self.device = torch.device(f"neuron:{device_id}")
         self.config = config
         self.rank = rank
@@ -102,9 +103,12 @@ class WanTI2V:
 
         self.vae_stride = config.vae_stride
         self.patch_size = config.patch_size
+        # For TP mode, only rank 0 runs VAE decode; others hold it on CPU
+        # to avoid wasting HBM on NeuronCores that never decode.
+        vae_device = self.device if (tp_degree <= 1 or rank == 0) else torch.device('cpu')
         self.vae = Wan2_2_VAE(
             vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
-            device=self.device)
+            device=vae_device)
 
         logging.info(f"Creating WanModel from {checkpoint_dir}")
         self.model = WanModel.from_pretrained(checkpoint_dir)
@@ -424,7 +428,7 @@ class WanTI2V:
                     generator=seed_g)[0]
                 latents = [temp_x0.squeeze(0).to(self.device)]
             x0 = [l.to(self.vae.device) for l in latents]
-            if offload_model or self.tp_degree > 1:
+            if offload_model and self.tp_degree <= 1:
                 self.model.cpu()
                 torch.accelerator.synchronize() if hasattr(torch, 'accelerator') else None
                 torch.neuron.empty_cache() if hasattr(torch, 'neuron') else None
@@ -661,7 +665,7 @@ class WanTI2V:
                 x0 = [latent_cpu.to(self.vae.device)]
                 del latent_model_input, timestep
 
-            if offload_model or self.tp_degree > 1:
+            if offload_model and self.tp_degree <= 1:
                 self.model.cpu()
                 torch.accelerator.synchronize() if hasattr(torch, 'accelerator') else None
                 torch.neuron.empty_cache() if hasattr(torch, 'neuron') else None

@@ -1,6 +1,7 @@
 import argparse
 import os
 import sys
+import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import imageio
@@ -67,6 +68,7 @@ def main():
 
     shift = args.shift if args.shift is not None else 5.0
 
+    t0 = time.time()
     video = pipeline.generate(
         input_prompt=args.prompt,
         img=img,
@@ -77,8 +79,15 @@ def main():
         sampling_steps=args.steps,
         guide_scale=args.guide_scale,
         seed=args.seed,
-        offload_model=True,
+        offload_model=(args.tp_degree == 1),
     )
+    denoise_time = time.time() - t0
+    f_lat = (args.frames - 1) // 4 + 1
+    # BF16 peak: 158 TFLOP/s per NeuronCore; TP uses tp_degree cores
+    peak_flops = 158e12 * args.tp_degree
+    tokens = f_lat * (h // 32) * (w // 32)
+    mfu = (6 * 5e9 * tokens * args.steps) / (denoise_time * peak_flops) * 100
+    print(f"Denoise time: {denoise_time:.1f}s | tokens: {tokens} | MFU: {mfu:.2f}% (TP={args.tp_degree})", flush=True)
 
     if video is not None:
         save_video(video, save_file=args.output, fps=args.fps)

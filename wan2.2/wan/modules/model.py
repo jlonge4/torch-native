@@ -40,6 +40,7 @@ def rope_params(max_seq_len, dim, theta=10000):
     return torch.stack([torch.cos(angles), torch.sin(angles)], dim=-1)
 
 
+@torch._dynamo.disable
 def rope_apply(x, grid_sizes, freqs):
     # x:     [B, seq_len+pad, n_heads, head_dim]
     # freqs: [max_seq_len, c, 2]  where c = head_dim//2, last dim = (cos, sin)
@@ -342,7 +343,7 @@ def apply_wan_tp(model, rank, tp_degree):
     """
     import torch.distributed as dist
 
-    pg = dist.group.WORLD  # default process group set up by caller
+    pg = None  # default process group
 
     def _col_shard(linear, rank, tp_degree):
         """Split output dim (colwise)."""
