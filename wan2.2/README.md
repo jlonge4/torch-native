@@ -6,7 +6,8 @@ Running [Wan2.2-TI2V-5B](https://github.com/Wan-Video/Wan2.2) (text/image-to-vid
 
 | Config | Output |
 |---|---|
-| 832×480, 61f, TP=4 + compile | [wan22_tp4_compile_61f_832x480.mp4](outputs/wan22_tp4_compile_61f_832x480.mp4) |
+| 832×480, 61f, TP=4 + compile | [wan22_tp4_compile_61f_v2.mp4](outputs/wan22_tp4_compile_61f_v2.mp4) |
+| 832×480, 61f, TP=4 eager | [wan22_tp4_eager_61f.mp4](outputs/wan22_tp4_eager_61f.mp4) |
 | 832×480, 61f, single-core (VAE on Neuron) | [wan22_832x480_61f_vae_neuron.mp4](outputs/wan22_832x480_61f_vae_neuron.mp4) |
 | 832×480, 61f, single-core | [wan22_832x480_61f_30steps.mp4](outputs/wan22_832x480_61f_30steps.mp4) |
 | 832×480, 41f, single-core | [wan22_832x480_41f_30steps.mp4](outputs/wan22_832x480_41f_30steps.mp4) |
@@ -21,7 +22,8 @@ All numbers on `trn2.3xlarge` (4 NeuronCores, 96 GB HBM), 832×480, 30 steps.
 |---|---|---|---|---|
 | Single-core eager | 21f | ~60s | ~90s | — |
 | Single-core eager | 61f | ~5m | 6m37s | — |
-| **TP=4 + torch.compile** | **61f** | **95s** | **293s** | **9.38%** |
+| TP=4 eager | 61f | 147s | 331s | 6.06% |
+| **TP=4 + torch.compile** | **61f** | **94s** | **279s** | **9.42%** |
 
 MFU = model FLOP utilization against 4 × 158 TFLOP/s (BF16) = 632 TFLOP/s aggregate.
 
