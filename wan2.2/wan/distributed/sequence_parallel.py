@@ -1,6 +1,5 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import torch
-import torch.cuda.amp as amp
 
 from ..modules.model import sinusoidal_embedding_1d
 from .ulysses import distributed_attention
@@ -20,45 +19,58 @@ def pad_freqs(original_tensor, target_len):
     return padded_tensor
 
 
-@torch.amp.autocast('cuda', enabled=False)
+@torch.amp.autocast('cpu', enabled=False)
 def rope_apply(x, grid_sizes, freqs):
     """
     x:          [B, L, N, C].
     grid_sizes: [B, 3].
-    freqs:      [M, C // 2].
+    freqs:      [M, C // 2, 2]  — (cos, sin) stacked, float32, no complex dtypes.
     """
     s, n, c = x.size(1), x.size(2), x.size(3) // 2
-    # split freqs
-    freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
 
-    # loop over samples
+    # split freqs along the c axis for temporal / height / width components
+    fs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+
+    sp_size = get_world_size()
+    sp_rank = get_rank()
+
     output = []
     for i, (f, h, w) in enumerate(grid_sizes.tolist()):
         seq_len = f * h * w
 
-        # precompute multipliers
-        x_i = torch.view_as_complex(x[i, :s].to(torch.float64).reshape(
-            s, n, -1, 2))
-        freqs_i = torch.cat([
-            freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
-            freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-            freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-        ],
-                            dim=-1).reshape(seq_len, 1, -1)
+        # build per-token cos/sin: [seq_len, 1, c]
+        cos_i = torch.cat([
+            fs[0][:f, :, 0].view(f, 1, 1, -1).expand(f, h, w, -1),
+            fs[1][:h, :, 0].view(1, h, 1, -1).expand(f, h, w, -1),
+            fs[2][:w, :, 0].view(1, 1, w, -1).expand(f, h, w, -1),
+        ], dim=-1).reshape(seq_len, 1, -1)
 
-        # apply rotary embedding
-        sp_size = get_world_size()
-        sp_rank = get_rank()
-        freqs_i = pad_freqs(freqs_i, s * sp_size)
-        s_per_rank = s
-        freqs_i_rank = freqs_i[(sp_rank * s_per_rank):((sp_rank + 1) *
-                                                       s_per_rank), :, :]
-        x_i = torch.view_as_real(x_i * freqs_i_rank).flatten(2)
-        x_i = torch.cat([x_i, x[i, s:]])
+        sin_i = torch.cat([
+            fs[0][:f, :, 1].view(f, 1, 1, -1).expand(f, h, w, -1),
+            fs[1][:h, :, 1].view(1, h, 1, -1).expand(f, h, w, -1),
+            fs[2][:w, :, 1].view(1, 1, w, -1).expand(f, h, w, -1),
+        ], dim=-1).reshape(seq_len, 1, -1)
 
-        # append to collection
-        output.append(x_i)
-    return torch.stack(output).float()
+        # pad to full sequence length across all SP ranks, then slice this rank's shard
+        cos_i = pad_freqs(cos_i, s * sp_size)
+        sin_i = pad_freqs(sin_i, s * sp_size)
+        cos_i = cos_i[sp_rank * s:(sp_rank + 1) * s]
+        sin_i = sin_i[sp_rank * s:(sp_rank + 1) * s]
+
+        # real-valued 2D rotation — no view_as_complex, no float64
+        xi = x[i, :s].float().reshape(s, n, c, 2)
+        x0, x1 = xi[..., 0], xi[..., 1]
+        out = torch.stack([x0 * cos_i - x1 * sin_i,
+                           x0 * sin_i + x1 * cos_i], dim=-1).flatten(2)
+
+        tail = x[i, s:]
+        if tail.shape[0] > 0:
+            out = torch.cat([out.to(x.dtype), tail])
+        else:
+            out = out.to(x.dtype)
+
+        output.append(out)
+    return torch.stack(output)
 
 
 def sp_dit_forward(
@@ -76,7 +88,6 @@ def sp_dit_forward(
     """
     if self.model_type == 'i2v':
         assert y is not None
-    # params
     device = self.patch_embedding.weight.device
     if self.freqs.device != device:
         self.freqs = self.freqs.to(device)
@@ -99,7 +110,7 @@ def sp_dit_forward(
     # time embeddings
     if t.dim() == 1:
         t = t.expand(t.size(0), seq_len)
-    with torch.amp.autocast('cuda', dtype=torch.float32):
+    with torch.amp.autocast('cpu', enabled=False):
         bt = t.size(0)
         t = t.flatten()
         e = self.time_embedding(
@@ -116,12 +127,11 @@ def sp_dit_forward(
             for u in context
         ]))
 
-    # Context Parallel
+    # Context Parallel — shard sequence across ranks
     x = torch.chunk(x, get_world_size(), dim=1)[get_rank()]
     e = torch.chunk(e, get_world_size(), dim=1)[get_rank()]
     e0 = torch.chunk(e0, get_world_size(), dim=1)[get_rank()]
 
-    # arguments
     kwargs = dict(
         e=e0,
         seq_lens=seq_lens,
@@ -136,7 +146,7 @@ def sp_dit_forward(
     # head
     x = self.head(x, e)
 
-    # Context Parallel
+    # gather sequence from all ranks
     x = gather_forward(x, dim=1)
 
     # unpatchify
@@ -151,7 +161,6 @@ def sp_attn_forward(self, x, seq_lens, grid_sizes, freqs, dtype=torch.bfloat16):
     def half(x):
         return x if x.dtype in half_dtypes else x.to(dtype)
 
-    # query, key, value function
     def qkv_fn(x):
         q = self.norm_q(self.q(x)).view(b, s, n, d)
         k = self.norm_k(self.k(x)).view(b, s, n, d)
@@ -167,10 +176,8 @@ def sp_attn_forward(self, x, seq_lens, grid_sizes, freqs, dtype=torch.bfloat16):
         half(k),
         half(v),
         seq_lens,
-        window_size=self.window_size,
     )
 
-    # output
     x = x.flatten(2)
     x = self.o(x)
     return x

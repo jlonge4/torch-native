@@ -18,7 +18,7 @@ from tqdm import tqdm
 from .distributed.fsdp import shard_model
 from .distributed.sequence_parallel import sp_attn_forward, sp_dit_forward
 from .distributed.util import get_world_size
-from .modules.model import WanModel
+from .modules.model import WanModel, apply_wan_tp
 from .modules.t5 import T5EncoderModel
 from .modules.vae2_2 import Wan2_2_VAE
 from .utils.fm_solvers import (
@@ -44,6 +44,8 @@ class WanTI2V:
         t5_cpu=False,
         init_on_cpu=True,
         convert_model_dtype=False,
+        tp_degree=1,
+        compile_model=False,
     ):
         r"""
         Initializes the Wan text-to-video generation model components.
@@ -71,6 +73,13 @@ class WanTI2V:
                 Convert DiT model parameters dtype to 'config.param_dtype'.
                 Only works without FSDP.
         """
+        self.tp_degree = tp_degree
+        if tp_degree > 1:
+            if not dist.is_initialized():
+                dist.init_process_group(backend="neuron")
+            rank = dist.get_rank()
+            device_id = rank  # each rank owns its NeuronCore
+            t5_cpu = True  # avoid replicating T5 (~11GB) across all NeuronCores
         self.device = torch.device(f"neuron:{device_id}")
         self.config = config
         self.rank = rank
@@ -94,9 +103,12 @@ class WanTI2V:
 
         self.vae_stride = config.vae_stride
         self.patch_size = config.patch_size
+        # For TP mode, only rank 0 runs VAE decode; others hold it on CPU
+        # to avoid wasting HBM on NeuronCores that never decode.
+        vae_device = self.device if (tp_degree <= 1 or rank == 0) else torch.device('cpu')
         self.vae = Wan2_2_VAE(
             vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
-            device=self.device)
+            device=vae_device)
 
         logging.info(f"Creating WanModel from {checkpoint_dir}")
         self.model = WanModel.from_pretrained(checkpoint_dir)
@@ -106,6 +118,17 @@ class WanTI2V:
             dit_fsdp=dit_fsdp,
             shard_fn=shard_fn,
             convert_model_dtype=convert_model_dtype)
+
+        if tp_degree > 1:
+            # load on CPU → shard weights across ranks → move to device
+            apply_wan_tp(self.model, rank=self.rank, tp_degree=tp_degree)
+            self.model.to(self.device)
+            self.init_on_cpu = False  # already on device; skip re-move in loop
+
+        self.compile_model = compile_model
+        if compile_model:
+            self.model = torch.compile(self.model, backend="neuron", fullgraph=False)
+            print(f"[rank {self.rank}] DiT compiled with torch.compile(backend='neuron')", flush=True)
 
         if use_sp:
             self.sp_size = get_world_size()
@@ -170,7 +193,8 @@ class WanTI2V:
                  guide_scale=5.0,
                  n_prompt="",
                  seed=-1,
-                 offload_model=True):
+                 offload_model=True,
+                 latent_only=False):
         r"""
         Generates video frames from text prompt using diffusion process.
 
@@ -221,7 +245,8 @@ class WanTI2V:
                 guide_scale=guide_scale,
                 n_prompt=n_prompt,
                 seed=seed,
-                offload_model=offload_model)
+                offload_model=offload_model,
+                latent_only=latent_only)
         # t2v
         return self.t2v(
             input_prompt=input_prompt,
@@ -233,7 +258,8 @@ class WanTI2V:
             guide_scale=guide_scale,
             n_prompt=n_prompt,
             seed=seed,
-            offload_model=offload_model)
+            offload_model=offload_model,
+            latent_only=latent_only)
 
     def t2v(self,
             input_prompt,
@@ -245,7 +271,8 @@ class WanTI2V:
             guide_scale=5.0,
             n_prompt="",
             seed=-1,
-            offload_model=True):
+            offload_model=True,
+            latent_only=False):
         r"""
         Generates video frames from text prompt using diffusion process.
 
@@ -279,6 +306,10 @@ class WanTI2V:
                 - H: Frame height (from size)
                 - W: Frame width from size)
         """
+        # TP model weights are sharded across devices — cannot offload to CPU
+        if self.tp_degree > 1:
+            offload_model = False
+
         # preprocess
         F = frame_num
         target_shape = (self.vae.model.z_dim, (F - 1) // self.vae_stride[0] + 1,
@@ -299,7 +330,7 @@ class WanTI2V:
             self.text_encoder.model.to(self.device)
             context = self.text_encoder([input_prompt], self.device)
             context_null = self.text_encoder([n_prompt], self.device)
-            if offload_model:
+            if offload_model or self.tp_degree > 1:
                 self.text_encoder.model.cpu()
         else:
             context = self.text_encoder([input_prompt], torch.device('cpu'))
@@ -366,6 +397,12 @@ class WanTI2V:
                 self.model.to(self.device)
                 torch.neuron.empty_cache() if hasattr(torch, 'neuron') else None
 
+            # Sync all TP ranks before first forward so only one rank wins the
+            # Neuron NEFF compile-cache lock and the others wait cleanly.
+            if self.tp_degree > 1:
+                dist.barrier()
+
+            _dynamo_explained = False
             for _, t in enumerate(tqdm(timesteps)):
                 latent_model_input = latents
                 timestep = [t]
@@ -379,6 +416,21 @@ class WanTI2V:
                     temp_ts.new_ones(seq_len - temp_ts.size(0)) * timestep
                 ])
                 timestep = temp_ts.unsqueeze(0)  # CPU float32
+
+                # compile-explain: only safe in non-TP mode (explain triggers
+                # all_reduce hooks on rank 0 alone → NRT error in TP mode).
+                # In TP mode, rely on TORCH_LOGS=graph_breaks instead.
+                if not _dynamo_explained and self.rank == 0 and self.tp_degree <= 1 and hasattr(self, 'compile_model') and self.compile_model:
+                    _dynamo_explained = True
+                    try:
+                        underlying = self.model._orig_mod if hasattr(self.model, '_orig_mod') else self.model
+                        exp = torch._dynamo.explain(underlying.forward)(
+                            latent_model_input, t=timestep, **arg_c)
+                        print(f"\n[compile-explain] graphs={exp.graph_count} breaks={exp.graph_break_count}", flush=True)
+                        for r in exp.break_reasons[:10]:
+                            print(f"  break: {r}", flush=True)
+                    except Exception as _e:
+                        print(f"[compile-explain] explain failed: {_e}", flush=True)
 
                 noise_pred_cond = self.model(
                     latent_model_input, t=timestep, **arg_c)[0].cpu()
@@ -395,8 +447,18 @@ class WanTI2V:
                     return_dict=False,
                     generator=seed_g)[0]
                 latents = [temp_x0.squeeze(0).to(self.device)]
+
+            if latent_only:
+                # Return raw latent on rank 0 (CPU) without VAE decode.
+                # Caller is responsible for running VAE decode in a separate
+                # process so DiT NEFFs are freed before VAE allocates HBM.
+                latent_cpu = latents[0].cpu() if self.rank == 0 else None
+                if dist.is_initialized():
+                    dist.barrier()
+                return latent_cpu
+
             x0 = [l.to(self.vae.device) for l in latents]
-            if offload_model:
+            if offload_model and self.tp_degree <= 1:
                 self.model.cpu()
                 torch.accelerator.synchronize() if hasattr(torch, 'accelerator') else None
                 torch.neuron.empty_cache() if hasattr(torch, 'neuron') else None
@@ -424,7 +486,8 @@ class WanTI2V:
             guide_scale=5.0,
             n_prompt="",
             seed=-1,
-            offload_model=True):
+            offload_model=True,
+            latent_only=False):
         r"""
         Generates video frames from input image and text prompt using diffusion process.
 
@@ -485,6 +548,10 @@ class WanTI2V:
                 self.patch_size[1] * self.patch_size[2])
         seq_len = int(math.ceil(seq_len / self.sp_size)) * self.sp_size
 
+        # TP model weights are sharded across devices — cannot offload to CPU
+        if self.tp_degree > 1:
+            offload_model = False
+
         seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
         seed_g = torch.Generator(device=torch.device("cpu"))
         seed_g.manual_seed(seed)
@@ -503,7 +570,7 @@ class WanTI2V:
             self.text_encoder.model.to(self.device)
             context = self.text_encoder([input_prompt], self.device)
             context_null = self.text_encoder([n_prompt], self.device)
-            if offload_model:
+            if offload_model or self.tp_degree > 1:
                 self.text_encoder.model.cpu()
         else:
             context = self.text_encoder([input_prompt], torch.device('cpu'))
@@ -571,6 +638,12 @@ class WanTI2V:
                 self.model.to(self.device)
                 torch.neuron.empty_cache() if hasattr(torch, 'neuron') else None
 
+            # Sync all TP ranks before first forward so only one rank wins the
+            # Neuron NEFF compile-cache lock and the others wait cleanly.
+            if self.tp_degree > 1:
+                dist.barrier()
+
+            _dynamo_explained = False
             for _, t in enumerate(tqdm(timesteps)):
                 latent_model_input = [latent.to(self.device)]
                 timestep = [t]
@@ -584,6 +657,20 @@ class WanTI2V:
                     temp_ts.new_ones(seq_len - temp_ts.size(0)) * timestep
                 ])
                 timestep = temp_ts.unsqueeze(0)  # CPU float32
+
+                # On first step with compile, report graph breaks and fallback ops
+                if not _dynamo_explained and hasattr(self, 'compile_model') and self.compile_model:
+                    _dynamo_explained = True
+                    if self.rank == 0:
+                        try:
+                            underlying = self.model._orig_mod if hasattr(self.model, '_orig_mod') else self.model
+                            exp = torch._dynamo.explain(underlying.forward)(
+                                latent_model_input, t=timestep, **arg_c)
+                            print(f"\n[compile-explain] graphs={exp.graph_count} breaks={exp.graph_break_count}", flush=True)
+                            for r in exp.break_reasons:
+                                print(f"  break: {r}", flush=True)
+                        except Exception as _e:
+                            print(f"[compile-explain] explain failed: {_e}", flush=True)
 
                 noise_pred_cond = self.model(
                     latent_model_input, t=timestep, **arg_c)[0].cpu()
@@ -609,11 +696,16 @@ class WanTI2V:
                 x0 = [latent_cpu.to(self.vae.device)]
                 del latent_model_input, timestep
 
-            if offload_model:
+            if latent_only:
+                result = latent_cpu if self.rank == 0 else None
+                if dist.is_initialized():
+                    dist.barrier()
+                return result
+
+            if offload_model and self.tp_degree <= 1:
                 self.model.cpu()
                 torch.accelerator.synchronize() if hasattr(torch, 'accelerator') else None
                 torch.neuron.empty_cache() if hasattr(torch, 'neuron') else None
-
             if self.rank == 0:
                 videos = self.vae.decode(x0)
 

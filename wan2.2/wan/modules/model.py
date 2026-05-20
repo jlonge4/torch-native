@@ -12,6 +12,7 @@ from .attention import flash_attention, attention as _attention
 __all__ = ['WanModel']
 
 
+@torch._dynamo.disable
 def sinusoidal_embedding_1d(dim, position):
     # preprocess
     assert dim % 2 == 0
@@ -39,6 +40,7 @@ def rope_params(max_seq_len, dim, theta=10000):
     return torch.stack([torch.cos(angles), torch.sin(angles)], dim=-1)
 
 
+@torch._dynamo.disable
 def rope_apply(x, grid_sizes, freqs):
     # x:     [B, seq_len+pad, n_heads, head_dim]
     # freqs: [max_seq_len, c, 2]  where c = head_dim//2, last dim = (cos, sin)
@@ -127,6 +129,7 @@ class WanSelfAttention(nn.Module):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
+        self.num_heads_local = num_heads  # overridden by apply_wan_tp for TP
         self.head_dim = dim // num_heads
         self.window_size = window_size
         self.qk_norm = qk_norm
@@ -148,13 +151,25 @@ class WanSelfAttention(nn.Module):
             grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
         """
-        b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
+        b, s, n, d = *x.shape[:2], self.num_heads_local, self.head_dim
 
         # query, key, value function
         def qkv_fn(x):
-            q = self.norm_q(self.q(x)).view(b, s, n, d)
-            k = self.norm_k(self.k(x)).view(b, s, n, d)
-            v = self.v(x).view(b, s, n, d)
+            if self.num_heads_local < self.num_heads:
+                # TP mode: Q and K use full (un-sharded) weights so that
+                # norm_q/norm_k compute RMS over the full projection dim,
+                # matching single-core behavior. Then slice to local heads.
+                # V uses sharded weight (col-parallel) for memory efficiency.
+                hi = self._tp_rank * n
+                q = self.norm_q(self.q(x)).view(b, s, self.num_heads, d)
+                q = q[:, :, hi:hi + n, :].contiguous()
+                k = self.norm_k(self.k(x)).view(b, s, self.num_heads, d)
+                k = k[:, :, hi:hi + n, :].contiguous()
+                v = self.v(x).view(b, s, n, d)
+            else:
+                q = self.norm_q(self.q(x)).view(b, s, n, d)
+                k = self.norm_k(self.k(x)).view(b, s, n, d)
+                v = self.v(x).view(b, s, n, d)
             return q, k, v
 
         q, k, v = qkv_fn(x)
@@ -181,12 +196,21 @@ class WanCrossAttention(WanSelfAttention):
             context(Tensor): Shape [B, L2, C]
             context_lens(Tensor): Shape [B]
         """
-        b, n, d = x.size(0), self.num_heads, self.head_dim
+        b, n, d = x.size(0), self.num_heads_local, self.head_dim
 
         # compute query, key, value
-        q = self.norm_q(self.q(x)).view(b, -1, n, d)
-        k = self.norm_k(self.k(context)).view(b, -1, n, d)
-        v = self.v(context).view(b, -1, n, d)
+        if self.num_heads_local < self.num_heads:
+            # TP mode: same as self-attn — full Q, K with full norm, then slice.
+            hi = self._tp_rank * n
+            q = self.norm_q(self.q(x)).view(b, -1, self.num_heads, d)
+            q = q[:, :, hi:hi + n, :].contiguous()
+            k = self.norm_k(self.k(context)).view(b, -1, self.num_heads, d)
+            k = k[:, :, hi:hi + n, :].contiguous()
+            v = self.v(context).view(b, -1, n, d)
+        else:
+            q = self.norm_q(self.q(x)).view(b, -1, n, d)
+            k = self.norm_k(self.k(context)).view(b, -1, n, d)
+            v = self.v(context).view(b, -1, n, d)
 
         # compute attention (use _attention which falls back to sdpa when flash_attn absent)
         x = _attention(q, k, v, k_lens=context_lens)
@@ -302,6 +326,65 @@ class Head(nn.Module):
         head_in = (self.norm(x).float() * (1 + e[1].squeeze(2)) + e[0].squeeze(2)).to(x_dtype)
         x = self.head(head_in)
         return x
+
+
+def apply_wan_tp(model, rank, tp_degree):
+    """
+    Shard WanModel transformer blocks across tp_degree NeuronCores.
+
+    Strategy: manual weight sharding + dist.all_reduce forward hooks.
+    Avoids DTensor / parallelize_module so the existing eager Neuron path
+    is unchanged — only the linear weights are sliced per-rank and the
+    row-parallel outputs are all-reduced.
+
+    ColwiseParallel (q, k, v, ffn[0]):  split weight on dim=0 (output rows)
+    RowwiseParallel (o, ffn[2]):         split weight on dim=1 (input cols),
+                                         bias only on rank 0, all_reduce output
+    """
+    import torch.distributed as dist
+
+    pg = None  # default process group
+
+    def _col_shard(linear, rank, tp_degree):
+        """Split output dim (colwise)."""
+        w = linear.weight.data.chunk(tp_degree, dim=0)[rank].contiguous()
+        linear.weight = nn.Parameter(w)
+        if linear.bias is not None:
+            b = linear.bias.data.chunk(tp_degree, dim=0)[rank].contiguous()
+            linear.bias = nn.Parameter(b)
+
+    def _row_shard(linear, rank, tp_degree):
+        """Split input dim (rowwise); bias only on rank 0."""
+        w = linear.weight.data.chunk(tp_degree, dim=1)[rank].contiguous()
+        linear.weight = nn.Parameter(w)
+        if linear.bias is not None and rank != 0:
+            linear.bias = nn.Parameter(torch.zeros_like(linear.bias))
+
+    def _make_allreduce_hook(pg):
+        def hook(module, input, output):
+            dist.all_reduce(output, op=dist.ReduceOp.SUM, group=pg)
+            return output
+        return hook
+
+    for block in model.blocks:
+        for attn in (block.self_attn, block.cross_attn):
+            # Q and K are NOT sharded: norm_q/norm_k compute RMS over the full
+            # projection dim (3072), which is what the trained weights expect.
+            # Sharding Q/K changes the denominator of the RMS and produces wrong
+            # attention patterns. Only V and O are sharded.
+            _col_shard(attn.v, rank, tp_degree)
+            _row_shard(attn.o, rank, tp_degree)
+            attn.o.register_forward_hook(_make_allreduce_hook(pg))
+            # Store rank and heads-per-rank for slicing in forward
+            attn._tp_rank = rank
+            attn._tp_heads_per_rank = attn.num_heads // tp_degree
+            attn.num_heads_local = attn.num_heads // tp_degree
+
+        _col_shard(block.ffn[0], rank, tp_degree)
+        _row_shard(block.ffn[2], rank, tp_degree)
+        block.ffn[2].register_forward_hook(_make_allreduce_hook(pg))
+
+    return model
 
 
 class WanModel(ModelMixin, ConfigMixin):

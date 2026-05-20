@@ -1,264 +1,181 @@
-# Wan 2.2 on Trainium 2
+# Wan 2.2 on AWS Trainium 2
 
-Running Wan2.2-TI2V-5B (image-to-video) on AWS Trainium 2 using TorchNeuron Eager Mode.
-No diffusers — patched base code from the upstream Wan2.2 repo.
+Running [Wan2.2-TI2V-5B](https://github.com/Wan-Video/Wan2.2) (text/image-to-video) on AWS Trainium 2 using TorchNeuron Eager Mode with 4-way tensor parallelism and `torch.compile(backend="neuron")`.
 
-![wan22_832x480_61f_30steps](outputs/wan22_832x480_61f_30steps.gif)
+## Outputs
 
-*832×480, 61 frames, 30 steps, shift=5.0 — generated on trn2.3xlarge (TorchNeuron Eager)*
+| Config | Output |
+|---|---|
+| 832×480, 61f, TP=4 + compile | [wan22_tp4_compile_61f_832x480.mp4](outputs/wan22_tp4_compile_61f_832x480.mp4) |
+| 832×480, 61f, single-core (VAE on Neuron) | [wan22_832x480_61f_vae_neuron.mp4](outputs/wan22_832x480_61f_vae_neuron.mp4) |
+| 832×480, 61f, single-core | [wan22_832x480_61f_30steps.mp4](outputs/wan22_832x480_61f_30steps.mp4) |
+| 832×480, 41f, single-core | [wan22_832x480_41f_30steps.mp4](outputs/wan22_832x480_41f_30steps.mp4) |
+| 832×480, 21f, single-core | [wan22_832x480_21f_30steps.mp4](outputs/wan22_832x480_21f_30steps.mp4) |
+| 832×480, 21f, TP=4 | [wan22_tp4_21f.mp4](outputs/wan22_tp4_21f.mp4) |
+
+## Performance
+
+All numbers on `trn2.3xlarge` (4 NeuronCores, 96 GB HBM), 832×480, 30 steps.
+
+| Mode | Frames | Denoise | Total | MFU |
+|---|---|---|---|---|
+| Single-core eager | 21f | ~60s | ~90s | — |
+| Single-core eager | 61f | ~5m | 6m37s | — |
+| **TP=4 + torch.compile** | **61f** | **95s** | **293s** | **9.38%** |
+
+MFU = model FLOP utilization against 4 × 158 TFLOP/s (BF16) = 632 TFLOP/s aggregate.
+
+**torch.compile diagnostics (TP=4, 61f 832×480):**
+- Graph breaks: **2 unique sites** × 32 blocks = ~65 graphs total
+  - `model.py:570` — `sinusoidal_embedding_1d` (`@torch._dynamo.disable` — uses float64/CPU, deadlocks on Neuron)
+  - `model.py:178` — `rope_apply` (`@torch._dynamo.disable` — per-sample for-loops over dynamic shapes)
+- CPU fallback ops: **none**
 
 ## Instance
 
 | | |
 |---|---|
-| Host | `trn2-2` (see `~/.ssh/config`) |
-| Type | `trn2.3xlarge` — 1 Neuron device, 4 NeuronCores, 96 GB HBM total |
+| Instance type | `trn2.3xlarge` |
+| NeuronCores | 4 (24 GB HBM each, 96 GB total) |
 | Venv | `/home/ubuntu/moduscope-deps-20260518-105742/ms_venv` |
-| Wan base | `/home/ubuntu/Wan2.2` (patched in-place) |
-| Generate script | `/home/ubuntu/wan22_generate.py` |
-
-## Repo structure
-
-```
-wan2.2/
-├── wan22_neuron_patches/       # drop-in replacements for Wan2.2/wan/
-│   ├── apply_patches.sh        # copies patches to /home/ubuntu/Wan2.2/wan/
-│   ├── attention.py            # flash_attention CUDA guard → SDPA fallback
-│   ├── model.py                # dtype fixes, CPU arithmetic, real-valued RoPE
-│   ├── textimage2video.py      # device, autocast, blending, scheduler on CPU
-│   ├── vae2_2.py               # autocast fix (neuron→cpu)
-│   ├── t5.py                   # (unchanged from upstream, kept for completeness)
-│   └── __init__.py
-├── run/
-│   └── wan22_generate.py       # CLI: --image, --size, --frames, --steps, --fps
-├── tests/
-│   └── ...
-└── outputs/
-    ├── wan22_480x256_21f_20steps_v2.mp4
-    └── wan22_480x256_81f_30steps.mp4
-```
-
-## Confirmed working configurations
-
-| Resolution | Frames | Steps | Denoise time | Notes |
-|---|---|---|---|---|
-| 256×256 | 5 | 1 | ~2 s | smoke test |
-| 480×256 | 21 | 20 | ~60 s | poor quality (wrong distribution) |
-| **832×480** | **21** | **30** | **~60 s** | **confirmed good quality** |
-| 832×480 | 41 | 30 | ~3 min | good quality |
-| 832×480 | 61 | 30 | ~5 min | good quality (see video above) |
-| 832×480 | 121 | — | OOM | too many tokens for per-core HBM |
-
-## Base repo
-
-```bash
-git clone https://github.com/Wan-Video/Wan2.2.git /home/ubuntu/Wan2.2
-cd /home/ubuntu/Wan2.2 && git checkout 42bf4cf
-```
+| Repo | `/home/ubuntu/torch-native` |
+| Weights | `/home/ubuntu/Wan2.2-TI2V-5B` |
 
 ## Quickstart
 
-### 1. Copy patches
-
 ```bash
-rsync -avz wan22_neuron_patches/ trn2-2:/home/ubuntu/wan22_neuron_patches/
-scp run/wan22_generate.py trn2-2:/home/ubuntu/wan22_generate.py
-ssh trn2-2 "bash /home/ubuntu/wan22_neuron_patches/apply_patches.sh"
+source /home/ubuntu/moduscope-deps-20260518-105742/ms_venv/bin/activate
+cd /home/ubuntu/torch-native/wan2.2
+
+# TP=4 + torch.compile — two-phase execution (denoise then VAE decode)
+# First run compiles and caches NEFFs (~6 min); subsequent runs use cache (~5 min)
+python run/wan22_generate.py \
+  --tp-degree 4 --compile \
+  --checkpoint-dir /home/ubuntu/Wan2.2-TI2V-5B \
+  --frames 61 --size 832x480 --steps 30 \
+  --output output.mp4
+
+# Single-core eager baseline
+python run/wan22_generate.py \
+  --checkpoint-dir /home/ubuntu/Wan2.2-TI2V-5B \
+  --frames 21 --size 832x480 --steps 30 \
+  --output output.mp4
 ```
 
-### 2. Generate video
+### Key flags
 
-```bash
-ssh trn2-2 "source /home/ubuntu/moduscope-deps-20260518-105742/ms_venv/bin/activate && \
-  python /home/ubuntu/wan22_generate.py \
-    --image example \
-    --size 480x256 \
-    --frames 81 \
-    --steps 30 \
-    --fps 24 \
-    --prompt 'A red panda playing in bamboo forest, cinematic, 4k' \
-    --output /home/ubuntu/output.mp4 2>&1 | tee /home/ubuntu/generate.log"
-scp trn2-2:/home/ubuntu/output.mp4 outputs/
-```
+| Flag | Default | Description |
+|---|---|---|
+| `--tp-degree` | `1` | Tensor parallel degree. `4` = all NeuronCores on trn2.3xlarge |
+| `--compile` | off | `torch.compile(backend="neuron")` on the DiT |
+| `--frames` | `21` | Number of frames (must be 4n+1) |
+| `--size` | `832x480` | WxH |
+| `--steps` | `30` | Denoising steps |
+| `--seed` | `42` | RNG seed |
 
-- `--image example` uses the bundled `Wan2.2-TI2V-5B/examples/i2v_input.JPG`
-- `--image /path/to/img.jpg` for a custom image
-- Omit `--image` for text-to-video (t2v) mode
+## Architecture
 
----
+### Two-phase execution (TP mode)
 
-## Pipeline: what runs where
+Neuron NEFFs (compiled kernels) **stay resident in HBM for the entire process lifetime** — `model.cpu()`, `empty_cache()`, and Python GC do not evict them. After 30 denoising steps the DiT's compiled graphs occupy most of each NeuronCore's HBM. If VAE decode runs in the same process it OOMs.
+
+Fix: split into two subprocesses:
 
 ```
-Input image (PIL)
-       │
-       ▼
-┌─────────────────────────────────────────────┐
-│  VAE encode  [CPU]                          │
-│  Wan2_2_VAE(device='cpu')                   │
-│  CausalConv3d encoder → 48-channel latent   │
-│  Output: z [48, F_lat, H_lat, W_lat]        │
-└─────────────────────────────────────────────┘
-       │
-       ▼  blend: z[:,0] = encoded ref frame
-          z[:,1:] = random noise
-       │
-┌─────────────────────────────────────────────┐
-│  T5 text encoder  [CPU]                     │
-│  t5_cpu=True; context tensors moved to      │
-│  Neuron only for the model forward pass     │
-└─────────────────────────────────────────────┘
-       │
-       ▼
-┌─────────────────────────────────────────────┐
-│  Denoising loop (N steps)                   │
-│                                             │
-│  ┌──────────────────────────────────────┐   │
-│  │  Scheduler / mask / timestep [CPU]   │   │
-│  │  FlowUniPCMultistepScheduler         │   │
-│  │  masks_like, temp_ts construction    │   │
-│  └──────────────────────────────────────┘   │
-│                                             │
-│  ┌──────────────────────────────────────┐   │
-│  │  WanModel forward  [NEURON:0]        │   │
-│  │  5B-param DiT, 30 transformer blocks │   │
-│  │  Input: 48-ch latent on neuron:0     │   │
-│  │  Output: 48-ch noise pred → .cpu()   │   │
-│  └──────────────────────────────────────┘   │
-│                                             │
-│  ┌──────────────────────────────────────┐   │
-│  │  Scheduler step + re-blend  [CPU]    │   │
-│  │  Re-pin frame 0 to reference latent  │   │
-│  └──────────────────────────────────────┘   │
-└─────────────────────────────────────────────┘
-       │
-       ▼
-┌─────────────────────────────────────────────┐
-│  VAE decode  [CPU]                          │
-│  48-ch latent → [3, T, H, W] video          │
-└─────────────────────────────────────────────┘
-       │
-       ▼
-     mp4 (imageio + ffmpeg)
+Phase 1 — torchrun --nproc-per-node 4 (TP denoising)
+  └─ all 4 ranks denoise → rank 0 saves latent to /tmp/wan_tp_latent.pt → all ranks exit
+     (DiT NEFFs freed on process exit)
+
+Phase 2 — python (single process, clean HBM)
+  └─ load latent → VAE decode on neuron:0 → save mp4
 ```
 
-**Why CPU for everything except the DiT forward:** TorchNeuron Eager
-compiles a new NEFF for every unique op+tensor-shape combination on first
-use. Scalar ops, per-element mask arithmetic, and scheduler math each
-produce tiny compilations that take minutes each. Keeping those on CPU
-avoids hundreds of spurious compilations per step.
+The parent `run/wan22_generate.py` orchestrates both phases via `subprocess.run`.
 
----
+### TP sharding plan
 
-## Patches: what changed and why
+Q and K are **not sharded** — `WanRMSNorm` computes RMS over the full projection dimension (3072). Sharding Q/K changes that denominator and produces garbled output.
+
+```
+Q, K   — unsharded: full [5120, 3072] on every rank
+V      — ColwiseParallel: [5120, 768] per rank (TP=4)
+O      — RowwiseParallel: [768, 5120] per rank + all-reduce
+FFN[0] — ColwiseParallel
+FFN[2] — RowwiseParallel + all-reduce
+```
+
+### What runs where (TP=4)
+
+```
+Input prompt / image
+        │
+        ▼
+T5 text encoder [CPU]
+  offloaded after encoding to free HBM for DiT shards
+        │
+        ▼
+VAE encode [neuron:0, rank 0 only]
+  image → 48-channel latent; blended with noise for i2v
+        │
+        ▼
+Denoising loop (N steps) ──── scheduler / mask / timestep  [CPU]
+  WanModel forward [neuron:0-3, TP=4]
+  Q,K unsharded · V,O,FFN sharded + all-reduce per block
+        │
+        ▼  (process exit — DiT NEFFs evicted)
+VAE decode [neuron:0, fresh process]
+  latent → pixel frames
+        │
+        ▼
+mp4 (imageio + ffmpeg)
+```
+
+## Changes from upstream
 
 ### `attention.py`
 
-**Problem:** `flash_attention()` asserts `q.device.type == 'cuda'`.
-`flash_attn` is a CUDA-only library; it is not installed on trn2-2.
-
-**Fix:** Added a non-CUDA branch before the assert that falls through to
-`F.scaled_dot_product_attention`. On Neuron this hits the hardware's fused
-SDPA kernel; on CPU it uses PyTorch's math path.
-
-`model.py` also imports `attention as _attention` and calls `_attention()`
-instead of `flash_attention()` at both self-attention and cross-attention sites.
-
----
+`flash_attention()` asserts `q.device.type == 'cuda'`. Non-CUDA path falls through to `F.scaled_dot_product_attention` with `attn_mask=None` (Neuron SDPA does not accept boolean masks).
 
 ### `model.py`
 
-| Problem | Root cause | Fix |
-|---|---|---|
-| `autocast('neuron')` causes device confusion / hang | TorchNeuron 2.11 bug | Changed all autocast contexts to `autocast('cpu', enabled=False)` |
-| dtype mismatch at `patch_embedding` | `convert_model_dtype=True` casts weights to bf16; inputs are fp32 | `x = [u.to(dtype=emb_dtype) for u in x]` before patch_embedding |
-| dtype mismatch at `time_embedding` | `sin_emb_dev` hardcoded to `torch.bfloat16` | Cast to `emb_dtype` instead |
-| dtype mismatch at `text_embedding` | Zero-pad tensors were fp32; linear layer was bf16 | Cast context to `emb_dtype` during padding |
-| `WanLayerNorm` crash with bf16 weights | `F.layer_norm` with bf16 weight/bias requires bf16 input, but code does `x.float()` first | Cast `weight` and `bias` to float32 explicitly in `WanLayerNorm.forward` |
-| RoPE `view_as_complex` deadlocks on Neuron | Neuron doesn't support float64 or complex dtypes | Replaced with real-valued float32 rotation; `rope_params` returns `(cos,sin)` stacked as `[L, c, 2]`; `rope_apply` uses explicit 2D rotation |
-| Per-element timestep/mask ops trigger NEFF recompilation | Each new tensor shape on Neuron compiles a NEFF on first use | All mask/timestep/scheduler ops kept on CPU; only `.to(self.device)` before DiT forward |
-
----
+| Problem | Fix |
+|---|---|
+| `autocast('neuron')` hangs | `autocast('cpu', enabled=False)` |
+| `view_as_complex` / float64 deadlocks on Neuron | Real-valued float32 RoPE: `rope_params` returns `(cos, sin)` stacked as `[L, c, 2]` |
+| `sinusoidal_embedding_1d` crashes Neuron compiler (`aten.div.Tensor` with int) | `@torch._dynamo.disable` |
+| `rope_apply` for-loops over `grid_sizes.tolist()` break Dynamo trace | `@torch._dynamo.disable` |
+| TP sharding garbled Q/K (wrong RMSNorm denominator) | Keep Q, K unsharded; shard V, O, FFN only |
+| `dist.group.WORLD` in all-reduce hooks | Use `None` (correct default pg) |
+| `WanLayerNorm` crash with bf16 weights | Cast weight/bias to float32 before `F.layer_norm` |
 
 ### `textimage2video.py`
 
-**autocast:** Both t2v and i2v paths used `autocast('cuda', ...)` / `autocast('neuron', ...)`.
-Changed to `autocast('cpu', enabled=False)`.
+| Problem | Fix |
+|---|---|
+| T5 (~11 GB) replicated on all 4 NeuronCores | `t5_cpu=True` forced when `tp_degree > 1` |
+| VAE (~0.5 GB) allocated on all 4 NeuronCores | Only rank 0 gets `device=neuron:0`; others get `device=cpu` |
+| `model.cpu()` called on compiled TP model | Skip offload when `tp_degree > 1` |
+| DiT NEFFs block VAE decode (same process) | Two-phase subprocess split; `latent_only=True` returns raw latent |
 
-**i2v architecture — the key one:**
-An incorrect assumption was that the TI2V model takes separate `y` channels
-(mask + z_ref). The correct architecture is:
-- `vae.model.z_dim = 48` — VAE outputs 48-channel latents
-- `WanModel in_dim = 48` — takes the 48-ch blended latent directly; no `y` concatenation
-- Reference conditioning is done by **blending** (not a separate channel)
+## Confirmed working configurations
 
-```python
-# Before loop: pin frame 0 to VAE-encoded reference
-latent_cpu = (1. - mask2[0]) * z[0].cpu() + mask2[0] * noise_cpu_i2v
-latent = latent_cpu.to(self.device)
+| Resolution | Frames | Steps | Mode | Status |
+|---|---|---|---|---|
+| 832×480 | 21f | 30 | single-core | ✓ |
+| 832×480 | 61f | 30 | single-core | ✓ |
+| 832×480 | 21f | 30 | TP=4 | ✓ |
+| **832×480** | **61f** | **30** | **TP=4 + compile** | **✓** |
+| 832×480 | 121f | 30 | single-core | ✗ OOM |
 
-# After each step: re-pin frame 0
-latent_cpu = (1. - mask2[0]) * z[0].cpu() + mask2[0] * latent_cpu
-```
+## Base repo
 
-Previous wrong approach built `y_model = cat([mask(48), zref(48)])` = 96 channels,
-then the model did `cat([x(48), y(96)])` = 144 channels into a `in_dim=48`
-conv, causing the error:
-```
-RuntimeError: expected input[1, 144, 2, 68, 50] to have 48 channels
-```
-
-**VAE encode device:** `img.to(self.device)` moved the image to Neuron, but
-the VAE runs on CPU. Fixed: `z = self.vae.encode([img.cpu()])`.
-
-**seed_g generator:** Must be on CPU; Neuron doesn't support device-placed generators.
-
-**`--size` ignored in i2v:** The `generate()` method passes `max_area` not `size`
-to `i2v()`. Fixed by passing `max_area=w*h` from `wan22_generate.py`.
-
----
-
-### `vae2_2.py`
-
-`encode()` and `decode()` used `amp.autocast('neuron', ...)`.
-VAE runs on CPU; `'neuron'` autocast causes device confusion.
-Changed to `amp.autocast('cpu', dtype=self.dtype, enabled=False)`.
-
----
-
-### `run/wan22_generate.py`
-
-- Added `--image [path|'example']` for i2v mode
-- Added `max_area=w*h` in the `generate()` call so `--size` is respected in i2v
-- Replaced `torchvision.io.write_video` (removed in torchvision 0.26) with
-  `imageio.get_writer(..., format='ffmpeg', codec='libx264')`
-
----
-
-## Resolution / frame count limits
-
-Token count: `T = F_lat × (H/32) × (W/32)` where `F_lat = (frames-1)//4 + 1`
-
-| Config | T | Status |
-|---|---|---|
-| 256×256, 5f | 160 | ✓ |
-| 480×256, 21f | 720 | ✓ |
-| 480×256, 81f | 2520 | ✓ |
-| 832×480, 21f | 2340 | ✓ |
-| 832×480, 41f | 4290 | ✓ |
-| 832×480, 61f | 6240 | ✓ |
-| 832×480, 121f | 12090 | ✗ OOM (`Failed to allocate resource`) |
-
-Keep T below ~8000 on trn2.3xlarge (4 NeuronCores, 96 GB HBM).
-
----
+[Wan-Video/Wan2.2](https://github.com/Wan-Video/Wan2.2) @ `42bf4cf`.
 
 ## Environment
 
 | Package | Version |
 |---|---|
-| torch (TorchNeuron Eager) | 2.10.0+cpu |
-| torch_neuronx | 0.1.0+29019d8b |
+| torch | 2.10.0+cpu |
+| torch-neuronx (Neuron SDK) | via ms_venv |
 | torchvision | 0.26.0+cpu |
-| imageio | 2.37.3 |
 | Python | 3.12 |
