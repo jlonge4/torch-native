@@ -99,6 +99,18 @@ def run_denoise_phase(args):
         tokens = f_lat * (h // 32) * (w // 32)
         mfu = (6 * 5e9 * tokens * args.steps) / (denoise_time * peak_flops) * 100
         print(f"Denoise time: {denoise_time:.1f}s | tokens: {tokens} | MFU: {mfu:.2f}% (TP={args.tp_degree})", flush=True)
+
+        if args.compile:
+            try:
+                import torch_neuronx
+                fallback = torch_neuronx.get_fallback_ops()
+                if fallback:
+                    print(f"[neuron] CPU fallback ops: {fallback}", flush=True)
+                else:
+                    print("[neuron] No CPU fallback ops.", flush=True)
+            except Exception as e:
+                print(f"[neuron] Could not get fallback ops: {e}", flush=True)
+
         torch.save(latent.cpu(), args.latent_path)
         print(f"Latent saved to {args.latent_path}", flush=True)
 
