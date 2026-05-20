@@ -11,8 +11,8 @@ with 4-way tensor parallelism across all NeuronCores and `torch.compile(backend=
 |---|---|
 | Type | `trn2.3xlarge` — 1 Neuron device, 4 NeuronCores, 96 GB HBM total |
 | Venv | `/home/ubuntu/moduscope-deps-20260518-105742/ms_venv` |
-| Wan install | `/home/ubuntu/Wan2.2` |
-| Generate script | `run/wan22_generate.py` |
+| Repo | `/home/ubuntu/torch-native` |
+| Generate script | `wan2.2/run/wan22_generate.py` |
 
 ## Repo structure
 
@@ -40,30 +40,27 @@ Started from [Wan-Video/Wan2.2](https://github.com/Wan-Video/Wan2.2) at commit `
 ### 1. Install on instance
 
 ```bash
-cd /home/ubuntu/Wan2.2
 git clone -b tp-compile https://github.com/jlonge4/torch-native.git
-cp torch-native/wan2.2/run/wan22_generate.py .
-cp -r torch-native/wan2.2/wan/. wan/
 ```
 
-### 2. Generate video — TP=4, single core
+### 2. Generate video
 
 ```bash
 source /home/ubuntu/moduscope-deps-20260518-105742/ms_venv/bin/activate
 
 # Single core (baseline)
-python wan22_generate.py \
+python torch-native/wan2.2/run/wan22_generate.py \
   --image example --size 832x480 --frames 21 --steps 30 \
   --output output_single.mp4
 
 # TP=4 across all NeuronCores
-torchrun --nproc-per-node 4 wan22_generate.py \
+torchrun --nproc-per-node 4 torch-native/wan2.2/run/wan22_generate.py \
   --tp-degree 4 \
   --image example --size 832x480 --frames 21 --steps 30 \
   --output output_tp4.mp4
 
 # TP=4 + torch.compile (first run compiles NEFFs, subsequent runs use cache)
-torchrun --nproc-per-node 4 wan22_generate.py \
+torchrun --nproc-per-node 4 torch-native/wan2.2/run/wan22_generate.py \
   --tp-degree 4 --compile \
   --image example --size 832x480 --frames 21 --steps 30 \
   --output output_tp4_compiled.mp4
