@@ -193,7 +193,8 @@ class WanTI2V:
                  guide_scale=5.0,
                  n_prompt="",
                  seed=-1,
-                 offload_model=True):
+                 offload_model=True,
+                 latent_only=False):
         r"""
         Generates video frames from text prompt using diffusion process.
 
@@ -244,7 +245,8 @@ class WanTI2V:
                 guide_scale=guide_scale,
                 n_prompt=n_prompt,
                 seed=seed,
-                offload_model=offload_model)
+                offload_model=offload_model,
+                latent_only=latent_only)
         # t2v
         return self.t2v(
             input_prompt=input_prompt,
@@ -256,7 +258,8 @@ class WanTI2V:
             guide_scale=guide_scale,
             n_prompt=n_prompt,
             seed=seed,
-            offload_model=offload_model)
+            offload_model=offload_model,
+            latent_only=latent_only)
 
     def t2v(self,
             input_prompt,
@@ -268,7 +271,8 @@ class WanTI2V:
             guide_scale=5.0,
             n_prompt="",
             seed=-1,
-            offload_model=True):
+            offload_model=True,
+            latent_only=False):
         r"""
         Generates video frames from text prompt using diffusion process.
 
@@ -427,6 +431,16 @@ class WanTI2V:
                     return_dict=False,
                     generator=seed_g)[0]
                 latents = [temp_x0.squeeze(0).to(self.device)]
+
+            if latent_only:
+                # Return raw latent on rank 0 (CPU) without VAE decode.
+                # Caller is responsible for running VAE decode in a separate
+                # process so DiT NEFFs are freed before VAE allocates HBM.
+                latent_cpu = latents[0].cpu() if self.rank == 0 else None
+                if dist.is_initialized():
+                    dist.barrier()
+                return latent_cpu
+
             x0 = [l.to(self.vae.device) for l in latents]
             if offload_model and self.tp_degree <= 1:
                 self.model.cpu()
@@ -456,7 +470,8 @@ class WanTI2V:
             guide_scale=5.0,
             n_prompt="",
             seed=-1,
-            offload_model=True):
+            offload_model=True,
+            latent_only=False):
         r"""
         Generates video frames from input image and text prompt using diffusion process.
 
@@ -664,6 +679,12 @@ class WanTI2V:
 
                 x0 = [latent_cpu.to(self.vae.device)]
                 del latent_model_input, timestep
+
+            if latent_only:
+                result = latent_cpu if self.rank == 0 else None
+                if dist.is_initialized():
+                    dist.barrier()
+                return result
 
             if offload_model and self.tp_degree <= 1:
                 self.model.cpu()
