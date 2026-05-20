@@ -1,6 +1,7 @@
 import argparse
+import os
 import sys
-sys.path.insert(0, '/home/ubuntu/Wan2.2')
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import imageio
 import numpy as np
