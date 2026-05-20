@@ -42,4 +42,7 @@ def free_model(model):
             _free_storage(m._handle.flat_param.data)
     del model
     gc.collect()
-    torch.cuda.empty_cache()
+    if hasattr(torch, 'neuron'):
+        torch.neuron.empty_cache()
+    elif hasattr(torch.cuda, 'is_available') and torch.cuda.is_available():
+        torch.cuda.empty_cache()
