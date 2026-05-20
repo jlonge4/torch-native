@@ -187,6 +187,6 @@ mp4 (imageio + ffmpeg)
 | Package | Version |
 |---|---|
 | torch | 2.10.0+cpu |
-| torch-neuronx (Neuron SDK) | via ms_venv |
+| torch-neuronx (Neuron SDK) | 2.10.0 |
 | torchvision | 0.26.0+cpu |
 | Python | 3.12 |
