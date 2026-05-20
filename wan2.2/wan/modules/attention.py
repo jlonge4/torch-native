@@ -168,7 +168,7 @@ def attention(
             # [B, 1, 1, Lk] boolean mask — True = valid, False = masked out
             lk = k.size(1)
             attn_mask = (torch.arange(lk, device=k.device).unsqueeze(0) <
-                         k_lens.unsqueeze(1)).unsqueeze(1).unsqueeze(2)
+                         k_lens.to(k.device).unsqueeze(1)).unsqueeze(1).unsqueeze(2)
 
         q = q.transpose(1, 2).to(dtype)
         k = k.transpose(1, 2).to(dtype)
