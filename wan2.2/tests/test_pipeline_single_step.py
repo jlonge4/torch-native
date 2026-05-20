@@ -8,10 +8,6 @@ Usage:
     python tests/test_pipeline_single_step.py \
         --checkpoint-dir /home/ubuntu/Wan2.2/Wan2.2-TI2V-5B
 
-The script imports WanTI2V from the installed wan package (after patches have
-been applied with tests/apply_patches.sh). To run against the local patch files
-directly, set WAN_PKG environment variable to the wan package parent directory:
-    WAN_PKG=/home/ubuntu/Wan2.2 python tests/test_pipeline_single_step.py ...
 """
 import argparse
 import os
@@ -23,17 +19,13 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 # Allow running from runway-ml root
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-wan_pkg = os.environ.get("WAN_PKG", "/home/ubuntu/Wan2.2")
-if wan_pkg not in sys.path:
-    sys.path.insert(0, wan_pkg)
-
 import torch
 
 
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--checkpoint-dir",
-                   default="/home/ubuntu/Wan2.2/Wan2.2-TI2V-5B",
+                   default="/home/ubuntu/Wan2.2-TI2V-5B",
                    help="Path to TI2V-5B checkpoint directory")
     p.add_argument("--device-id", type=int, default=0)
     p.add_argument("--prompt", default="A panda eating bamboo in a misty forest.",

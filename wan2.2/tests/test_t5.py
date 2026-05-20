@@ -23,7 +23,7 @@ import torch
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--checkpoint-dir",
-                   default="/home/ubuntu/Wan2.2/Wan2.2-TI2V-5B",
+                   default="/home/ubuntu/Wan2.2-TI2V-5B",
                    help="Path to TI2V-5B checkpoint directory")
     p.add_argument("--device", default="neuron",
                    help="'cpu' or 'neuron' (default: neuron)")
