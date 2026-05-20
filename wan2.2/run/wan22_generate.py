@@ -173,6 +173,10 @@ def main():
 
     t_total = time.time()
 
+    env = os.environ.copy()
+    if args.compile:
+        env["TORCH_LOGS"] = "graph_breaks"
+
     if args.tp_degree > 1:
         print(f"=== Phase 1: TP Denoise (torchrun --nproc-per-node {args.tp_degree}) ===", flush=True)
         denoise_cmd = [
@@ -184,7 +188,7 @@ def main():
         print("=== Phase 1: Denoise ===", flush=True)
         denoise_cmd = [sys.executable, script] + base_cmd + ["--phase", "denoise"]
 
-    subprocess.run(denoise_cmd, check=True)
+    subprocess.run(denoise_cmd, check=True, env=env)
 
     print("=== Phase 2: VAE decode (fresh process, no DiT NEFFs in HBM) ===", flush=True)
     vae_cmd = [sys.executable, script] + base_cmd + ["--phase", "vae"]
