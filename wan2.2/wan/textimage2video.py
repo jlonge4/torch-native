@@ -423,11 +423,12 @@ class WanTI2V:
                     return_dict=False,
                     generator=seed_g)[0]
                 latents = [temp_x0.squeeze(0).to(self.device)]
-            x0 = [l.to(self.vae.device) for l in latents]
+            x0 = [l.cpu() for l in latents]
             if offload_model or self.tp_degree > 1:
                 self.model.cpu()
                 torch.accelerator.synchronize() if hasattr(torch, 'accelerator') else None
                 torch.neuron.empty_cache() if hasattr(torch, 'neuron') else None
+            self.vae.model.cpu()
             if self.rank == 0:
                 videos = self.vae.decode(x0)
 
@@ -658,7 +659,7 @@ class WanTI2V:
                 latent_cpu = (1. - mask2[0]) * z[0] + mask2[0] * latent_cpu
                 latent = latent_cpu.to(self.device)
 
-                x0 = [latent_cpu.to(self.vae.device)]
+                x0 = [latent_cpu]
                 del latent_model_input, timestep
 
             if offload_model or self.tp_degree > 1:
@@ -666,6 +667,7 @@ class WanTI2V:
                 torch.accelerator.synchronize() if hasattr(torch, 'accelerator') else None
                 torch.neuron.empty_cache() if hasattr(torch, 'neuron') else None
 
+            self.vae.model.cpu()
             if self.rank == 0:
                 videos = self.vae.decode(x0)
 
