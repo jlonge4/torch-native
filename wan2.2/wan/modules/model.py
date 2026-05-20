@@ -12,6 +12,7 @@ from .attention import flash_attention, attention as _attention
 __all__ = ['WanModel']
 
 
+@torch._dynamo.disable
 def sinusoidal_embedding_1d(dim, position):
     # preprocess
     assert dim % 2 == 0

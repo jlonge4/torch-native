@@ -45,6 +45,7 @@ class WanTI2V:
         init_on_cpu=True,
         convert_model_dtype=False,
         tp_degree=1,
+        compile_model=False,
     ):
         r"""
         Initializes the Wan text-to-video generation model components.
@@ -119,6 +120,11 @@ class WanTI2V:
             apply_wan_tp(self.model, rank=self.rank, tp_degree=tp_degree)
             self.model.to(self.device)
             self.init_on_cpu = False  # already on device; skip re-move in loop
+
+        self.compile_model = compile_model
+        if compile_model:
+            self.model = torch.compile(self.model, backend="neuron", fullgraph=False)
+            print(f"[rank {self.rank}] DiT compiled with torch.compile(backend='neuron')", flush=True)
 
         if use_sp:
             self.sp_size = get_world_size()
@@ -383,6 +389,11 @@ class WanTI2V:
                 self.model.to(self.device)
                 torch.neuron.empty_cache() if hasattr(torch, 'neuron') else None
 
+            # Sync all TP ranks before first forward so only one rank wins the
+            # Neuron NEFF compile-cache lock and the others wait cleanly.
+            if self.tp_degree > 1:
+                dist.barrier()
+
             for _, t in enumerate(tqdm(timesteps)):
                 latent_model_input = latents
                 timestep = [t]
@@ -592,6 +603,12 @@ class WanTI2V:
                 self.model.to(self.device)
                 torch.neuron.empty_cache() if hasattr(torch, 'neuron') else None
 
+            # Sync all TP ranks before first forward so only one rank wins the
+            # Neuron NEFF compile-cache lock and the others wait cleanly.
+            if self.tp_degree > 1:
+                dist.barrier()
+
+            _dynamo_explained = False
             for _, t in enumerate(tqdm(timesteps)):
                 latent_model_input = [latent.to(self.device)]
                 timestep = [t]
@@ -605,6 +622,20 @@ class WanTI2V:
                     temp_ts.new_ones(seq_len - temp_ts.size(0)) * timestep
                 ])
                 timestep = temp_ts.unsqueeze(0)  # CPU float32
+
+                # On first step with compile, report graph breaks and fallback ops
+                if not _dynamo_explained and hasattr(self, 'compile_model') and self.compile_model:
+                    _dynamo_explained = True
+                    if self.rank == 0:
+                        try:
+                            underlying = self.model._orig_mod if hasattr(self.model, '_orig_mod') else self.model
+                            exp = torch._dynamo.explain(underlying.forward)(
+                                latent_model_input, t=timestep, **arg_c)
+                            print(f"\n[compile-explain] graphs={exp.graph_count} breaks={exp.graph_break_count}", flush=True)
+                            for r in exp.break_reasons:
+                                print(f"  break: {r}", flush=True)
+                        except Exception as _e:
+                            print(f"[compile-explain] explain failed: {_e}", flush=True)
 
                 noise_pred_cond = self.model(
                     latent_model_input, t=timestep, **arg_c)[0].cpu()

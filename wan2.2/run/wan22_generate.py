@@ -36,6 +36,8 @@ def parse_args():
     p.add_argument("--tp-degree", type=int, default=1,
                    help="Tensor parallel degree. Use 4 for all NeuronCores on trn2.3xlarge. "
                         "Must be launched with: torchrun --nproc-per-node TP_DEGREE")
+    p.add_argument("--compile", action="store_true",
+                   help="Apply torch.compile(backend='neuron') to the DiT model.")
     return p.parse_args()
 
 
@@ -58,6 +60,7 @@ def main():
         init_on_cpu=True,
         convert_model_dtype=True,
         tp_degree=args.tp_degree,
+        compile_model=args.compile,
     )
     print("Loaded.", flush=True)
 
@@ -79,6 +82,17 @@ def main():
     if video is not None:
         save_video(video, save_file=args.output, fps=args.fps)
         print(f"Saved to {args.output}", flush=True)
+
+    if args.compile:
+        try:
+            import torch_neuronx
+            fallback = torch_neuronx.get_fallback_ops()
+            if fallback:
+                print(f"[rank 0] Neuron CPU fallback ops: {fallback}", flush=True)
+            else:
+                print("[rank 0] No CPU fallback ops detected.", flush=True)
+        except Exception as e:
+            print(f"[rank 0] Could not get fallback ops: {e}", flush=True)
 
 
 if __name__ == "__main__":
