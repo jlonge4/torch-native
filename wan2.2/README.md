@@ -8,11 +8,6 @@ Running [Wan2.2-TI2V-5B](https://github.com/Wan-Video/Wan2.2) (text/image-to-vid
 |---|---|
 | 832×480, 61f, TP=4 + compile | [wan22_tp4_compile_61f_v2.mp4](outputs/wan22_tp4_compile_61f_v2.mp4) |
 | 832×480, 61f, TP=4 eager | [wan22_tp4_eager_61f.mp4](outputs/wan22_tp4_eager_61f.mp4) |
-| 832×480, 61f, single-core (VAE on Neuron) | [wan22_832x480_61f_vae_neuron.mp4](outputs/wan22_832x480_61f_vae_neuron.mp4) |
-| 832×480, 61f, single-core | [wan22_832x480_61f_30steps.mp4](outputs/wan22_832x480_61f_30steps.mp4) |
-| 832×480, 41f, single-core | [wan22_832x480_41f_30steps.mp4](outputs/wan22_832x480_41f_30steps.mp4) |
-| 832×480, 21f, single-core | [wan22_832x480_21f_30steps.mp4](outputs/wan22_832x480_21f_30steps.mp4) |
-| 832×480, 21f, TP=4 | [wan22_tp4_21f.mp4](outputs/wan22_tp4_21f.mp4) |
 
 ## Performance
 
