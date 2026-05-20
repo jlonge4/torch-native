@@ -43,7 +43,7 @@ Started from [Wan-Video/Wan2.2](https://github.com/Wan-Video/Wan2.2) at commit `
 cd /home/ubuntu/Wan2.2
 git clone -b tp-compile https://github.com/jlonge4/torch-native.git
 cp torch-native/wan2.2/run/wan22_generate.py .
-cp -r torch-native/wan2.2/wan/ wan/
+cp -r torch-native/wan2.2/wan/. wan/
 ```
 
 ### 2. Generate video — TP=4, single core
