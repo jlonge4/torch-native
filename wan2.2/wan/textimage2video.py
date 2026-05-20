@@ -417,7 +417,10 @@ class WanTI2V:
                 ])
                 timestep = temp_ts.unsqueeze(0)  # CPU float32
 
-                if not _dynamo_explained and self.rank == 0 and hasattr(self, 'compile_model') and self.compile_model:
+                # compile-explain: only safe in non-TP mode (explain triggers
+                # all_reduce hooks on rank 0 alone → NRT error in TP mode).
+                # In TP mode, rely on TORCH_LOGS=graph_breaks instead.
+                if not _dynamo_explained and self.rank == 0 and self.tp_degree <= 1 and hasattr(self, 'compile_model') and self.compile_model:
                     _dynamo_explained = True
                     try:
                         underlying = self.model._orig_mod if hasattr(self.model, '_orig_mod') else self.model
