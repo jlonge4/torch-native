@@ -4,6 +4,8 @@ Running [Wan2.2-TI2V-5B](https://github.com/Wan-Video/Wan2.2) (text/image-to-vid
 
 ## Outputs
 
+![TP=4 + torch.compile, 832×480 61f](outputs/wan22_tp4_compile_61f_v2.gif)
+
 | Config | Output |
 |---|---|
 | 832×480, 61f, TP=4 + compile | [wan22_tp4_compile_61f_v2.mp4](outputs/wan22_tp4_compile_61f_v2.mp4) |
