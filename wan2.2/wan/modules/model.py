@@ -122,7 +122,7 @@ class WanRMSNorm(nn.Module):
         Args:
             x(Tensor): Shape [B, L, C]
         """
-        if _NKI_AVAILABLE and not (DTensor is not None and isinstance(x, DTensor)):
+        if _NKI_AVAILABLE and not (DTensor is not None and isinstance(self.weight, DTensor)):
             return nki_rmsnorm(x, self.weight)
         return self._norm(x.float()).type_as(x) * self.weight
 
