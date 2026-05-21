@@ -10,7 +10,7 @@ from diffusers.models.modeling_utils import ModelMixin
 from .attention import flash_attention, attention as _attention
 
 try:
-    from .nki_ops import nki_rmsnorm, nki_rope
+    from .nki_ops import nki_rmsnorm
     _NKI_AVAILABLE = True
 except (ImportError, Exception):
     _NKI_AVAILABLE = False
@@ -65,25 +65,11 @@ def rope_apply(x, grid_sizes, freqs):
             fs[2][:w, :, 1].view(1, 1, w, -1).expand(f, h, w, -1),
         ], dim=-1).reshape(seq_len, 1, -1)
 
-        if _NKI_AVAILABLE:
-            # NKI RoPE kernel expects:
-            #   x:   [d_head, B, n_heads, S]
-            #   cos: [d_head//2, B, S]
-            #   sin: [d_head//2, B, S]
-            # xi: [seq_len, n_heads, head_dim] → [head_dim, 1, n_heads, seq_len]
-            xi = x[i, :seq_len].permute(2, 1, 0).unsqueeze(1).contiguous()  # [d, 1, n, S]
-            # cos_i/sin_i: [seq_len, 1, c] → [c, 1, seq_len]
-            cos_nki = cos_i.squeeze(1).t().unsqueeze(1).contiguous()  # [c, 1, S]
-            sin_nki = sin_i.squeeze(1).t().unsqueeze(1).contiguous()  # [c, 1, S]
-            out = nki_rope(xi, cos_nki, sin_nki)   # [d, 1, n, S]
-            # [d, 1, n, S] → [S, n, d]
-            out = out.squeeze(1).permute(2, 1, 0).contiguous()
-        else:
-            # real-valued 2D rotation — no view_as_complex, no float64
-            xi = x[i, :seq_len].float().reshape(seq_len, n, c, 2)
-            x0, x1 = xi[..., 0], xi[..., 1]
-            out = torch.stack([x0 * cos_i - x1 * sin_i,
-                               x0 * sin_i + x1 * cos_i], dim=-1).flatten(2)
+        # real-valued 2D rotation — no view_as_complex, no float64
+        xi = x[i, :seq_len].float().reshape(seq_len, n, c, 2)
+        x0, x1 = xi[..., 0], xi[..., 1]
+        out = torch.stack([x0 * cos_i - x1 * sin_i,
+                           x0 * sin_i + x1 * cos_i], dim=-1).flatten(2)
 
         # Neuron: torch.cat with zero-size tensor deadlocks — skip if no padding
         tail = x[i, seq_len:]
@@ -331,21 +317,28 @@ def apply_wan_tp(model, rank, tp_degree):
     """
     Shard WanModel transformer blocks across tp_degree NeuronCores.
 
-    Strategy: manual weight sharding + dist.all_reduce forward hooks.
-    Avoids DTensor / parallelize_module so the existing eager Neuron path
-    is unchanged — only the linear weights are sliced per-rank and the
-    row-parallel outputs are all-reduced.
-
-    ColwiseParallel (q, k, v, ffn[0]):  split weight on dim=0 (output rows)
-    RowwiseParallel (o, ffn[2]):         split weight on dim=1 (input cols),
-                                         bias only on rank 0, all_reduce output
+    Hybrid strategy:
+      - FFN: DTensor parallelize_module (ColwiseParallel / RowwiseParallel)
+        handles sharding + all-reduce automatically (clean Sequential, no
+        custom ops between layers).
+      - Attention Q/K/V/O: manual weight sharding + forward hook all-reduce.
+        Custom ops between projections (RoPE, distributed RMSNorm, reshape)
+        break DTensor's placement propagation, so manual is more reliable.
+      - RMSNorm on Q/K: sharded weight + all-reduce sum-of-squares to recover
+        global statistics from the sharded projection output.
     """
     import torch.distributed as dist
+    from torch.distributed.device_mesh import DeviceMesh
+    from torch.distributed.tensor.parallel import (
+        ColwiseParallel,
+        RowwiseParallel,
+        parallelize_module,
+    )
 
+    tp_mesh = DeviceMesh("neuron", list(range(tp_degree)))
     pg = None  # default process group
 
     def _col_shard(linear, rank, tp_degree):
-        """Split output dim (colwise)."""
         w = linear.weight.data.chunk(tp_degree, dim=0)[rank].contiguous()
         linear.weight = nn.Parameter(w)
         if linear.bias is not None:
@@ -353,7 +346,6 @@ def apply_wan_tp(model, rank, tp_degree):
             linear.bias = nn.Parameter(b)
 
     def _row_shard(linear, rank, tp_degree):
-        """Split input dim (rowwise); bias only on rank 0."""
         w = linear.weight.data.chunk(tp_degree, dim=1)[rank].contiguous()
         linear.weight = nn.Parameter(w)
         if linear.bias is not None and rank != 0:
@@ -365,29 +357,31 @@ def apply_wan_tp(model, rank, tp_degree):
             return output
         return hook
 
-    def _shard_rmsnorm(norm, rank, tp_degree, pg):
-        """Shard norm weight and enable distributed all-reduce for statistics."""
-        full_dim = norm.dim
-        w = norm.weight.data.chunk(tp_degree, dim=0)[rank].contiguous()
-        norm.weight = nn.Parameter(w)
-        norm.dim = w.shape[0]
-        norm._tp_group = pg
-        norm._full_dim = full_dim
+    ffn_tp_plan = {
+        "0": ColwiseParallel(),
+        "2": RowwiseParallel(),
+    }
 
     for block in model.blocks:
+        # FFN: DTensor handles sharding + all-reduce
+        parallelize_module(block.ffn, tp_mesh, ffn_tp_plan)
+
+        # Attention: manual sharding (custom ops break DTensor propagation)
         for attn in (block.self_attn, block.cross_attn):
             _col_shard(attn.q, rank, tp_degree)
             _col_shard(attn.k, rank, tp_degree)
             _col_shard(attn.v, rank, tp_degree)
             _row_shard(attn.o, rank, tp_degree)
             attn.o.register_forward_hook(_make_allreduce_hook(pg))
-            _shard_rmsnorm(attn.norm_q, rank, tp_degree, pg)
-            _shard_rmsnorm(attn.norm_k, rank, tp_degree, pg)
             attn.num_heads_local = attn.num_heads // tp_degree
-
-        _col_shard(block.ffn[0], rank, tp_degree)
-        _row_shard(block.ffn[2], rank, tp_degree)
-        block.ffn[2].register_forward_hook(_make_allreduce_hook(pg))
+            # Shard norm weights + enable distributed statistics
+            for norm in (attn.norm_q, attn.norm_k):
+                full_dim = norm.dim
+                w = norm.weight.data.chunk(tp_degree, dim=0)[rank].contiguous()
+                norm.weight = nn.Parameter(w)
+                norm.dim = w.shape[0]
+                norm._tp_group = pg
+                norm._full_dim = full_dim
 
     return model
 
