@@ -166,14 +166,32 @@ def attention(
             warnings.warn(
                 'Padding mask is disabled when using scaled_dot_product_attention. It can have a significant impact on performance.'
             )
-        attn_mask = None
 
+        # NKI flash attention path (Trainium 2)
+        try:
+            from .nki_ops import nki_attn_cte
+            # q, k, v: [B, S, n_heads, d_head] → merge batch+heads, pre-scale q
+            b, s, n, d = q.shape
+            scale = d ** -0.5
+            # [B, S, n, d] → [B, n, S, d] → [B*n, S, d]
+            q_3d = q.to(dtype).permute(0, 2, 1, 3).reshape(b * n, s, d).contiguous()
+            q_3d = q_3d * scale
+            # k transposed: [B*n, d, S]
+            k_3d = k.to(dtype).permute(0, 2, 3, 1).reshape(b * n, d, s).contiguous()
+            v_3d = v.to(dtype).permute(0, 2, 1, 3).reshape(b * n, s, d).contiguous()
+            out = nki_attn_cte(q_3d, k_3d, v_3d)
+            # [B*n, S, d] → [B, n, S, d] → [B, S, n, d]
+            out = out.reshape(b, n, s, d).permute(0, 2, 1, 3).contiguous()
+            return out.type(q.dtype)
+        except (ImportError, Exception):
+            pass
+
+        # Fallback: standard SDPA
+        attn_mask = None
         q = q.transpose(1, 2).to(dtype)
         k = k.transpose(1, 2).to(dtype)
         v = v.transpose(1, 2).to(dtype)
-
         out = torch.nn.functional.scaled_dot_product_attention(
             q, k, v, attn_mask=attn_mask, is_causal=causal, dropout_p=dropout_p)
-
         out = out.transpose(1, 2).contiguous()
         return out

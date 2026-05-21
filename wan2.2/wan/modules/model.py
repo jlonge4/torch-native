@@ -12,21 +12,14 @@ from .attention import flash_attention, attention as _attention
 __all__ = ['WanModel']
 
 
-@torch._dynamo.disable
 def sinusoidal_embedding_1d(dim, position):
-    # preprocess
     assert dim % 2 == 0
     half = dim // 2
-    # Compute entirely on CPU in float64 for precision, return float32.
-    # Neuron doesn't support float64 or int dtypes (causes deadlock).
-    # Caller is responsible for moving result to the target device.
-    position_cpu = position.detach().float().cpu().double()
-
-    # calculation
-    sinusoid = torch.outer(
-        position_cpu, torch.pow(10000, -torch.arange(half, dtype=torch.float64).div(half)))
+    position = position.float()
+    freqs = torch.pow(10000, -torch.arange(half, dtype=torch.float32, device=position.device) / half)
+    sinusoid = torch.outer(position, freqs)
     x = torch.cat([torch.cos(sinusoid), torch.sin(sinusoid)], dim=1)
-    return x.float()  # return float32 on CPU
+    return x
 
 
 def rope_params(max_seq_len, dim, theta=10000):
@@ -49,6 +42,12 @@ def rope_apply(x, grid_sizes, freqs):
     # split freqs along the c axis for temporal / height / width components
     fs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
 
+    try:
+        from .nki_ops import nki_rope
+        _use_nki = True
+    except (ImportError, Exception):
+        _use_nki = False
+
     output = []
     for i, (f, h, w) in enumerate(grid_sizes.tolist()):
         seq_len = f * h * w
@@ -66,12 +65,25 @@ def rope_apply(x, grid_sizes, freqs):
             fs[2][:w, :, 1].view(1, 1, w, -1).expand(f, h, w, -1),
         ], dim=-1).reshape(seq_len, 1, -1)
 
-        # real-valued 2D rotation — no view_as_complex, no float64
-        # upcast to float32 for rotation precision, then cast back to input dtype
-        xi = x[i, :seq_len].float().reshape(seq_len, n, c, 2)
-        x0, x1 = xi[..., 0], xi[..., 1]
-        out = torch.stack([x0 * cos_i - x1 * sin_i,
-                           x0 * sin_i + x1 * cos_i], dim=-1).flatten(2)
+        if _use_nki:
+            # NKI RoPE kernel expects:
+            #   x:   [d_head, B, n_heads, S]
+            #   cos: [d_head//2, B, S]
+            #   sin: [d_head//2, B, S]
+            # xi: [seq_len, n_heads, head_dim] → [head_dim, 1, n_heads, seq_len]
+            xi = x[i, :seq_len].permute(2, 1, 0).unsqueeze(1).contiguous()  # [d, 1, n, S]
+            # cos_i/sin_i: [seq_len, 1, c] → [c, 1, seq_len]
+            cos_nki = cos_i.squeeze(1).t().unsqueeze(1).contiguous()  # [c, 1, S]
+            sin_nki = sin_i.squeeze(1).t().unsqueeze(1).contiguous()  # [c, 1, S]
+            out = nki_rope(xi, cos_nki, sin_nki)   # [d, 1, n, S]
+            # [d, 1, n, S] → [S, n, d]
+            out = out.squeeze(1).permute(2, 1, 0).contiguous()
+        else:
+            # real-valued 2D rotation — no view_as_complex, no float64
+            xi = x[i, :seq_len].float().reshape(seq_len, n, c, 2)
+            x0, x1 = xi[..., 0], xi[..., 1]
+            out = torch.stack([x0 * cos_i - x1 * sin_i,
+                               x0 * sin_i + x1 * cos_i], dim=-1).flatten(2)
 
         # Neuron: torch.cat with zero-size tensor deadlocks — skip if no padding
         tail = x[i, seq_len:]
@@ -94,6 +106,11 @@ class WanRMSNorm(nn.Module):
         Args:
             x(Tensor): Shape [B, L, C]
         """
+        try:
+            from .nki_ops import nki_rmsnorm
+            return nki_rmsnorm(x, self.weight)
+        except (ImportError, Exception):
+            pass
         return self._norm(x.float()).type_as(x) * self.weight
 
     def _norm(self, x):
