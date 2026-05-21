@@ -15,6 +15,11 @@ try:
 except (ImportError, Exception):
     _NKI_AVAILABLE = False
 
+try:
+    from torch.distributed._tensor import DTensor
+except ImportError:
+    DTensor = None
+
 __all__ = ['WanModel']
 
 
@@ -111,29 +116,18 @@ class WanRMSNorm(nn.Module):
         self.dim = dim
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
-        self._distributed = False
-        self._full_dim = dim
 
     def forward(self, x):
         r"""
         Args:
             x(Tensor): Shape [B, L, C]
         """
-        if self._distributed:
-            return self._distributed_norm(x)
-        if _NKI_AVAILABLE:
+        if _NKI_AVAILABLE and not (DTensor is not None and isinstance(x, DTensor)):
             return nki_rmsnorm(x, self.weight)
         return self._norm(x.float()).type_as(x) * self.weight
 
     def _norm(self, x):
         return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
-
-    def _distributed_norm(self, x):
-        xf = x.float()
-        local_sq_sum = xf.pow(2).sum(dim=-1, keepdim=True)
-        torch.distributed.all_reduce(local_sq_sum, op=torch.distributed.ReduceOp.SUM)
-        rms = torch.rsqrt(local_sq_sum / self._full_dim + self.eps)
-        return (xf * rms).type_as(x) * self.weight
 
 
 class WanLayerNorm(nn.LayerNorm):
@@ -189,9 +183,19 @@ class WanSelfAttention(nn.Module):
         """
         b, s, n, d = *x.shape[:2], self.num_heads_local, self.head_dim
 
-        q = self.norm_q(self.q(x)).view(b, s, n, d)
-        k = self.norm_k(self.k(x)).view(b, s, n, d)
-        v = self.v(x).view(b, s, n, d)
+        # Q/K/V projections produce Shard(-1) DTensors via ColwiseParallel.
+        # norm_q/norm_k operate on DTensors (weight is also Shard(0)).
+        # .to_local() extracts the local shard for RoPE and attention ops.
+        q = self.norm_q(self.q(x))
+        k = self.norm_k(self.k(x))
+        v = self.v(x)
+        if DTensor is not None and isinstance(q, DTensor):
+            q = q.to_local()
+            k = k.to_local()
+            v = v.to_local()
+        q = q.view(b, s, n, d)
+        k = k.view(b, s, n, d)
+        v = v.view(b, s, n, d)
 
         x = _attention(
             q=rope_apply(q, grid_sizes, freqs),
@@ -200,9 +204,15 @@ class WanSelfAttention(nn.Module):
             k_lens=seq_lens,
             window_size=self.window_size)
 
-        # output
+        # output: flatten and pass to RowwiseParallel o projection.
+        # Wrap as Shard(-1) DTensor so RowwiseParallel triggers all-reduce.
         x = x.flatten(2)
+        if DTensor is not None and hasattr(self, '_tp_mesh'):
+            from torch.distributed._tensor import Shard as _Shard
+            x = DTensor.from_local(x, self._tp_mesh, [_Shard(-1)])
         x = self.o(x)
+        if DTensor is not None and isinstance(x, DTensor):
+            x = x.to_local()
         return x
 
 
@@ -217,16 +227,26 @@ class WanCrossAttention(WanSelfAttention):
         """
         b, n, d = x.size(0), self.num_heads_local, self.head_dim
 
-        q = self.norm_q(self.q(x)).view(b, -1, n, d)
-        k = self.norm_k(self.k(context)).view(b, -1, n, d)
-        v = self.v(context).view(b, -1, n, d)
+        q = self.norm_q(self.q(x))
+        k = self.norm_k(self.k(context))
+        v = self.v(context)
+        if DTensor is not None and isinstance(q, DTensor):
+            q = q.to_local()
+            k = k.to_local()
+            v = v.to_local()
+        q = q.view(b, -1, n, d)
+        k = k.view(b, -1, n, d)
+        v = v.view(b, -1, n, d)
 
-        # compute attention (use _attention which falls back to sdpa when flash_attn absent)
         x = _attention(q, k, v, k_lens=context_lens)
 
-        # output
         x = x.flatten(2)
+        if DTensor is not None and hasattr(self, '_tp_mesh'):
+            from torch.distributed._tensor import Shard as _Shard
+            x = DTensor.from_local(x, self._tp_mesh, [_Shard(-1)])
         x = self.o(x)
+        if DTensor is not None and isinstance(x, DTensor):
+            x = x.to_local()
         return x
 
 
@@ -298,6 +318,8 @@ class WanAttentionBlock(nn.Module):
             x = x + self.cross_attn(self.norm3(x), context, context_lens)
             ffn_in = (self.norm2(x).float() * (1 + e[4].squeeze(2)) + e[3].squeeze(2)).to(x_dtype)
             y = self.ffn(ffn_in)
+            if DTensor is not None and isinstance(y, DTensor):
+                y = y.to_local()
             x = (x.float() + y.float() * e[5].squeeze(2)).to(x_dtype)
             return x
 
@@ -339,19 +361,14 @@ class Head(nn.Module):
 
 def apply_wan_tp(model, rank, tp_degree):
     """
-    Shard WanModel transformer blocks across tp_degree NeuronCores.
+    Shard WanModel transformer blocks across tp_degree NeuronCores using DTensor.
 
-    Hybrid strategy:
-      - FFN: DTensor parallelize_module (ColwiseParallel / RowwiseParallel)
-        handles sharding + all-reduce automatically (clean Sequential, no
-        custom ops between layers).
-      - Attention Q/K/V/O: manual weight sharding + forward hook all-reduce.
-        Custom ops between projections (RoPE, distributed RMSNorm, reshape)
-        break DTensor's placement propagation, so manual is more reliable.
-      - RMSNorm on Q/K: sharded weight + all-reduce sum-of-squares to recover
-        global statistics from the sharded projection output.
+    Uses parallelize_module with ColwiseParallel / RowwiseParallel for all
+    linear layers. norm_q/norm_k weights are converted to Shard(0) DTensors
+    so that elementwise multiply with the Shard(-1) Q/K output works correctly.
+    DTensor dispatch handles all communication (all-reduce for mean, etc.).
     """
-    import torch.distributed as dist
+    from torch.distributed._tensor import DTensor, Shard
     from torch.distributed.device_mesh import DeviceMesh
     from torch.distributed.tensor.parallel import (
         ColwiseParallel,
@@ -360,52 +377,33 @@ def apply_wan_tp(model, rank, tp_degree):
     )
 
     tp_mesh = DeviceMesh("neuron", list(range(tp_degree)))
-    pg = None  # default process group
 
-    def _col_shard(linear, rank, tp_degree):
-        w = linear.weight.data.chunk(tp_degree, dim=0)[rank].contiguous()
-        linear.weight = nn.Parameter(w)
-        if linear.bias is not None:
-            b = linear.bias.data.chunk(tp_degree, dim=0)[rank].contiguous()
-            linear.bias = nn.Parameter(b)
-
-    def _row_shard(linear, rank, tp_degree):
-        w = linear.weight.data.chunk(tp_degree, dim=1)[rank].contiguous()
-        linear.weight = nn.Parameter(w)
-        if linear.bias is not None and rank != 0:
-            linear.bias = nn.Parameter(torch.zeros_like(linear.bias))
-
-    def _make_allreduce_hook(pg):
-        def hook(module, input, output):
-            dist.all_reduce(output, op=dist.ReduceOp.SUM, group=pg)
-            return output
-        return hook
-
-    ffn_tp_plan = {
-        "0": ColwiseParallel(),
-        "2": RowwiseParallel(),
+    layer_tp_plan = {
+        "self_attn.q": ColwiseParallel(),
+        "self_attn.k": ColwiseParallel(),
+        "self_attn.v": ColwiseParallel(),
+        "self_attn.o": RowwiseParallel(),
+        "cross_attn.q": ColwiseParallel(),
+        "cross_attn.k": ColwiseParallel(),
+        "cross_attn.v": ColwiseParallel(),
+        "cross_attn.o": RowwiseParallel(),
+        "ffn.0": ColwiseParallel(),
+        "ffn.2": RowwiseParallel(),
     }
 
     for block in model.blocks:
-        # FFN: DTensor handles sharding + all-reduce
-        parallelize_module(block.ffn, tp_mesh, ffn_tp_plan)
-
-        # Attention: manual sharding (custom ops break DTensor propagation)
+        parallelize_module(block, tp_mesh, layer_tp_plan)
         for attn in (block.self_attn, block.cross_attn):
-            _col_shard(attn.q, rank, tp_degree)
-            _col_shard(attn.k, rank, tp_degree)
-            _col_shard(attn.v, rank, tp_degree)
-            _row_shard(attn.o, rank, tp_degree)
-            attn.o.register_forward_hook(_make_allreduce_hook(pg))
             attn.num_heads_local = attn.num_heads // tp_degree
-            # Shard norm weights + enable distributed statistics
+            attn._tp_mesh = tp_mesh
+            # Convert norm_q/norm_k weights to Shard(0) DTensors so they match
+            # the Shard(-1) output from ColwiseParallel Q/K projections
             for norm in (attn.norm_q, attn.norm_k):
-                full_dim = norm.dim
-                w = norm.weight.data.chunk(tp_degree, dim=0)[rank].contiguous()
-                norm.weight = nn.Parameter(w)
-                norm.dim = w.shape[0]
-                norm._distributed = True
-                norm._full_dim = full_dim
+                if hasattr(norm, 'weight'):
+                    local_w = norm.weight.data.chunk(tp_degree, dim=0)[rank].contiguous()
+                    norm.weight = nn.Parameter(
+                        DTensor.from_local(local_w, tp_mesh, [Shard(0)])
+                    )
 
     return model
 
