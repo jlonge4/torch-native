@@ -100,18 +100,30 @@ class WanRMSNorm(nn.Module):
         self.dim = dim
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
+        self._tp_group = None
+        self._full_dim = dim
 
     def forward(self, x):
         r"""
         Args:
             x(Tensor): Shape [B, L, C]
         """
+        if self._tp_group is not None:
+            return self._distributed_norm(x)
         if _NKI_AVAILABLE:
             return nki_rmsnorm(x, self.weight)
         return self._norm(x.float()).type_as(x) * self.weight
 
     def _norm(self, x):
         return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+
+    def _distributed_norm(self, x):
+        xf = x.float()
+        local_sq_sum = xf.pow(2).sum(dim=-1, keepdim=True)
+        import torch.distributed as dist
+        dist.all_reduce(local_sq_sum, op=dist.ReduceOp.SUM, group=self._tp_group)
+        rms = torch.rsqrt(local_sq_sum / self._full_dim + self.eps)
+        return (xf * rms).type_as(x) * self.weight
 
 
 class WanLayerNorm(nn.LayerNorm):
@@ -167,26 +179,9 @@ class WanSelfAttention(nn.Module):
         """
         b, s, n, d = *x.shape[:2], self.num_heads_local, self.head_dim
 
-        # query, key, value function
-        def qkv_fn(x):
-            if self.num_heads_local < self.num_heads:
-                # TP mode: Q and K use full (un-sharded) weights so that
-                # norm_q/norm_k compute RMS over the full projection dim,
-                # matching single-core behavior. Then slice to local heads.
-                # V uses sharded weight (col-parallel) for memory efficiency.
-                hi = self._tp_rank * n
-                q = self.norm_q(self.q(x)).view(b, s, self.num_heads, d)
-                q = q[:, :, hi:hi + n, :].contiguous()
-                k = self.norm_k(self.k(x)).view(b, s, self.num_heads, d)
-                k = k[:, :, hi:hi + n, :].contiguous()
-                v = self.v(x).view(b, s, n, d)
-            else:
-                q = self.norm_q(self.q(x)).view(b, s, n, d)
-                k = self.norm_k(self.k(x)).view(b, s, n, d)
-                v = self.v(x).view(b, s, n, d)
-            return q, k, v
-
-        q, k, v = qkv_fn(x)
+        q = self.norm_q(self.q(x)).view(b, s, n, d)
+        k = self.norm_k(self.k(x)).view(b, s, n, d)
+        v = self.v(x).view(b, s, n, d)
 
         x = _attention(
             q=rope_apply(q, grid_sizes, freqs),
@@ -212,19 +207,9 @@ class WanCrossAttention(WanSelfAttention):
         """
         b, n, d = x.size(0), self.num_heads_local, self.head_dim
 
-        # compute query, key, value
-        if self.num_heads_local < self.num_heads:
-            # TP mode: same as self-attn — full Q, K with full norm, then slice.
-            hi = self._tp_rank * n
-            q = self.norm_q(self.q(x)).view(b, -1, self.num_heads, d)
-            q = q[:, :, hi:hi + n, :].contiguous()
-            k = self.norm_k(self.k(context)).view(b, -1, self.num_heads, d)
-            k = k[:, :, hi:hi + n, :].contiguous()
-            v = self.v(context).view(b, -1, n, d)
-        else:
-            q = self.norm_q(self.q(x)).view(b, -1, n, d)
-            k = self.norm_k(self.k(context)).view(b, -1, n, d)
-            v = self.v(context).view(b, -1, n, d)
+        q = self.norm_q(self.q(x)).view(b, -1, n, d)
+        k = self.norm_k(self.k(context)).view(b, -1, n, d)
+        v = self.v(context).view(b, -1, n, d)
 
         # compute attention (use _attention which falls back to sdpa when flash_attn absent)
         x = _attention(q, k, v, k_lens=context_lens)
@@ -380,18 +365,24 @@ def apply_wan_tp(model, rank, tp_degree):
             return output
         return hook
 
+    def _shard_rmsnorm(norm, rank, tp_degree, pg):
+        """Shard norm weight and enable distributed all-reduce for statistics."""
+        full_dim = norm.dim
+        w = norm.weight.data.chunk(tp_degree, dim=0)[rank].contiguous()
+        norm.weight = nn.Parameter(w)
+        norm.dim = w.shape[0]
+        norm._tp_group = pg
+        norm._full_dim = full_dim
+
     for block in model.blocks:
         for attn in (block.self_attn, block.cross_attn):
-            # Q and K are NOT sharded: norm_q/norm_k compute RMS over the full
-            # projection dim (3072), which is what the trained weights expect.
-            # Sharding Q/K changes the denominator of the RMS and produces wrong
-            # attention patterns. Only V and O are sharded.
+            _col_shard(attn.q, rank, tp_degree)
+            _col_shard(attn.k, rank, tp_degree)
             _col_shard(attn.v, rank, tp_degree)
             _row_shard(attn.o, rank, tp_degree)
             attn.o.register_forward_hook(_make_allreduce_hook(pg))
-            # Store rank and heads-per-rank for slicing in forward
-            attn._tp_rank = rank
-            attn._tp_heads_per_rank = attn.num_heads // tp_degree
+            _shard_rmsnorm(attn.norm_q, rank, tp_degree, pg)
+            _shard_rmsnorm(attn.norm_k, rank, tp_degree, pg)
             attn.num_heads_local = attn.num_heads // tp_degree
 
         _col_shard(block.ffn[0], rank, tp_degree)
