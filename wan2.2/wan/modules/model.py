@@ -39,44 +39,69 @@ def rope_params(max_seq_len, dim, theta=10000):
     return torch.stack([torch.cos(angles), torch.sin(angles)], dim=-1)
 
 
-@torch._dynamo.disable
 def rope_apply(x, grid_sizes, freqs):
-    # x:     [B, seq_len+pad, n_heads, head_dim]
-    # freqs: [max_seq_len, c, 2]  where c = head_dim//2, last dim = (cos, sin)
+    """
+    Trace-friendly 3D factored RoPE for batch=1.
+
+    x:          [1, seq_len_padded, n_heads, head_dim]
+    grid_sizes: [1, 3] — (F, H, W) after patchification
+    freqs:      [max_seq_len, c, 2] — precomputed (cos, sin), c = head_dim//2
+
+    Builds the factored position embedding using gather ops instead of
+    Python loops so that torch.compile can trace the full graph.
+    """
     n, c = x.size(2), x.size(3) // 2
+    seq_len = x.size(1)
 
-    # split freqs along the c axis for temporal / height / width components
-    fs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+    # Split freqs into temporal / height / width components
+    c_t = c - 2 * (c // 3)
+    c_h = c // 3
+    c_w = c // 3
+    freqs_t, freqs_h, freqs_w = freqs.split([c_t, c_h, c_w], dim=1)
 
-    output = []
-    for i, (f, h, w) in enumerate(grid_sizes.tolist()):
-        seq_len = f * h * w
+    # Extract grid dimensions — use indexing (traceable) not .tolist()
+    f = grid_sizes[0, 0]
+    h = grid_sizes[0, 1]
+    w = grid_sizes[0, 2]
+    n_tokens = f * h * w
 
-        # build per-token cos/sin: [seq_len, 1, c]
-        cos_i = torch.cat([
-            fs[0][:f, :, 0].view(f, 1, 1, -1).expand(f, h, w, -1),
-            fs[1][:h, :, 0].view(1, h, 1, -1).expand(f, h, w, -1),
-            fs[2][:w, :, 0].view(1, 1, w, -1).expand(f, h, w, -1),
-        ], dim=-1).reshape(seq_len, 1, -1)
+    # Build position indices for the 3D factored layout:
+    # For a token at position (t_idx, h_idx, w_idx) in the F×H×W grid,
+    # its linear index = t_idx * H * W + h_idx * W + w_idx
+    # We need: temporal_pos[i] = i // (H*W)
+    #          height_pos[i]  = (i // W) % H
+    #          width_pos[i]   = i % W
+    token_idx = torch.arange(seq_len, device=x.device)
+    hw = h * w
+    t_pos = token_idx // hw            # [seq_len]
+    h_pos = (token_idx // w) % h       # [seq_len]
+    w_pos = token_idx % w              # [seq_len]
 
-        sin_i = torch.cat([
-            fs[0][:f, :, 1].view(f, 1, 1, -1).expand(f, h, w, -1),
-            fs[1][:h, :, 1].view(1, h, 1, -1).expand(f, h, w, -1),
-            fs[2][:w, :, 1].view(1, 1, w, -1).expand(f, h, w, -1),
-        ], dim=-1).reshape(seq_len, 1, -1)
+    # Gather cos/sin for each component: freqs_* shape [max_seq_len, c_*, 2]
+    # Use index_select on dim=0, then concat along the c dimension
+    cos_t = freqs_t[t_pos, :, 0]  # [seq_len, c_t]
+    cos_h = freqs_h[h_pos, :, 0]  # [seq_len, c_h]
+    cos_w = freqs_w[w_pos, :, 0]  # [seq_len, c_w]
+    sin_t = freqs_t[t_pos, :, 1]  # [seq_len, c_t]
+    sin_h = freqs_h[h_pos, :, 1]  # [seq_len, c_h]
+    sin_w = freqs_w[w_pos, :, 1]  # [seq_len, c_w]
 
-        # real-valued 2D rotation — no view_as_complex, no float64
-        xi = x[i, :seq_len].float().reshape(seq_len, n, c, 2)
-        x0, x1 = xi[..., 0], xi[..., 1]
-        out = torch.stack([x0 * cos_i - x1 * sin_i,
-                           x0 * sin_i + x1 * cos_i], dim=-1).flatten(2)
+    cos_all = torch.cat([cos_t, cos_h, cos_w], dim=-1).unsqueeze(1)  # [seq_len, 1, c]
+    sin_all = torch.cat([sin_t, sin_h, sin_w], dim=-1).unsqueeze(1)  # [seq_len, 1, c]
 
-        # Neuron: torch.cat with zero-size tensor deadlocks — skip if no padding
-        tail = x[i, seq_len:]
-        output.append(torch.cat([out, tail.float()]) if tail.size(0) > 0 else out)
-    # Neuron: torch.stack with single-element list deadlocks — unsqueeze instead
-    stacked = output[0].unsqueeze(0) if len(output) == 1 else torch.stack(output)
-    return stacked.to(x.dtype)
+    # Zero out cos/sin for padding positions (beyond n_tokens)
+    # This makes the rotation identity (cos=1, sin=0) for padding
+    mask = (token_idx < n_tokens).unsqueeze(1).unsqueeze(2)  # [seq_len, 1, 1]
+    cos_all = torch.where(mask, cos_all, torch.ones_like(cos_all))
+    sin_all = torch.where(mask, sin_all, torch.zeros_like(sin_all))
+
+    # Apply rotation: x is [1, seq_len, n_heads, head_dim]
+    xi = x[0].float().reshape(seq_len, n, c, 2)
+    x0, x1 = xi[..., 0], xi[..., 1]
+    out = torch.stack([x0 * cos_all - x1 * sin_all,
+                       x0 * sin_all + x1 * cos_all], dim=-1).flatten(2)
+
+    return out.unsqueeze(0).to(x.dtype)
 
 
 class WanRMSNorm(nn.Module):
@@ -86,7 +111,7 @@ class WanRMSNorm(nn.Module):
         self.dim = dim
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
-        self._tp_group = None
+        self._distributed = False
         self._full_dim = dim
 
     def forward(self, x):
@@ -94,7 +119,7 @@ class WanRMSNorm(nn.Module):
         Args:
             x(Tensor): Shape [B, L, C]
         """
-        if self._tp_group is not None:
+        if self._distributed:
             return self._distributed_norm(x)
         if _NKI_AVAILABLE:
             return nki_rmsnorm(x, self.weight)
@@ -106,8 +131,7 @@ class WanRMSNorm(nn.Module):
     def _distributed_norm(self, x):
         xf = x.float()
         local_sq_sum = xf.pow(2).sum(dim=-1, keepdim=True)
-        import torch.distributed as dist
-        dist.all_reduce(local_sq_sum, op=dist.ReduceOp.SUM, group=self._tp_group)
+        torch.distributed.all_reduce(local_sq_sum, op=torch.distributed.ReduceOp.SUM)
         rms = torch.rsqrt(local_sq_sum / self._full_dim + self.eps)
         return (xf * rms).type_as(x) * self.weight
 
@@ -380,7 +404,7 @@ def apply_wan_tp(model, rank, tp_degree):
                 w = norm.weight.data.chunk(tp_degree, dim=0)[rank].contiguous()
                 norm.weight = nn.Parameter(w)
                 norm.dim = w.shape[0]
-                norm._tp_group = pg
+                norm._distributed = True
                 norm._full_dim = full_dim
 
     return model
