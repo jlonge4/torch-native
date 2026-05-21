@@ -8,6 +8,12 @@ except ModuleNotFoundError:
     FLASH_ATTN_3_AVAILABLE = False
 
 try:
+    from .nki_ops import nki_attn_cte
+    _NKI_AVAILABLE = True
+except (ImportError, Exception):
+    _NKI_AVAILABLE = False
+
+try:
     import flash_attn
     FLASH_ATTN_2_AVAILABLE = True
 except ModuleNotFoundError:
@@ -162,14 +168,8 @@ def attention(
             version=fa_version,
         )
     else:
-        if q_lens is not None or k_lens is not None:
-            warnings.warn(
-                'Padding mask is disabled when using scaled_dot_product_attention. It can have a significant impact on performance.'
-            )
-
         # NKI flash attention path (Trainium 2) — self-attention only (q and k same seq len)
-        try:
-            from .nki_ops import nki_attn_cte
+        if _NKI_AVAILABLE:
             b, s_q, n, d = q.shape
             s_k = k.shape[1]
             if s_q == s_k:  # skip for cross-attention where seq lens differ
@@ -183,8 +183,6 @@ def attention(
                 # [B*n, S, d] → [B, n, S, d] → [B, S, n, d]
                 out = out.reshape(b, n, s_q, d).permute(0, 2, 1, 3).contiguous()
                 return out.type(q.dtype)
-        except (ImportError, Exception):
-            pass
 
         # Fallback: standard SDPA
         attn_mask = None

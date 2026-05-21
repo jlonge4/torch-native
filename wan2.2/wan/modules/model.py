@@ -9,6 +9,12 @@ from diffusers.models.modeling_utils import ModelMixin
 
 from .attention import flash_attention, attention as _attention
 
+try:
+    from .nki_ops import nki_rmsnorm, nki_rope
+    _NKI_AVAILABLE = True
+except (ImportError, Exception):
+    _NKI_AVAILABLE = False
+
 __all__ = ['WanModel']
 
 
@@ -42,12 +48,6 @@ def rope_apply(x, grid_sizes, freqs):
     # split freqs along the c axis for temporal / height / width components
     fs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
 
-    try:
-        from .nki_ops import nki_rope
-        _use_nki = True
-    except (ImportError, Exception):
-        _use_nki = False
-
     output = []
     for i, (f, h, w) in enumerate(grid_sizes.tolist()):
         seq_len = f * h * w
@@ -65,7 +65,7 @@ def rope_apply(x, grid_sizes, freqs):
             fs[2][:w, :, 1].view(1, 1, w, -1).expand(f, h, w, -1),
         ], dim=-1).reshape(seq_len, 1, -1)
 
-        if _use_nki:
+        if _NKI_AVAILABLE:
             # NKI RoPE kernel expects:
             #   x:   [d_head, B, n_heads, S]
             #   cos: [d_head//2, B, S]
@@ -106,11 +106,8 @@ class WanRMSNorm(nn.Module):
         Args:
             x(Tensor): Shape [B, L, C]
         """
-        try:
-            from .nki_ops import nki_rmsnorm
+        if _NKI_AVAILABLE:
             return nki_rmsnorm(x, self.weight)
-        except (ImportError, Exception):
-            pass
         return self._norm(x.float()).type_as(x) * self.weight
 
     def _norm(self, x):
@@ -626,6 +623,7 @@ class WanModel(ModelMixin, ConfigMixin):
         x = self.unpatchify(x, grid_sizes)
         return [u.float() for u in x]
 
+    @torch._dynamo.disable
     def unpatchify(self, x, grid_sizes):
         r"""
         Reconstruct video tensors from patch embeddings.
